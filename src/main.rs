@@ -1,6 +1,8 @@
 use clap::Parser;
 use bio::io::{fasta, fastq};
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression as GzCompression;
 use zstd::stream::{Encoder, Decoder};
 use zstd::stream::raw::CParameter;
 use crossbeam_channel;
@@ -17,19 +19,31 @@ struct Args {
     /// Input FASTA/FASTQ file (.gz or .zst compressed are supported)
     #[arg(short, long)]
     input: String,
+
     /// Output directory (will be created if needed)
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "oreo-wdir")]
     output: String,
+
     /// Fingerprint bit-length P. The algorithm uses an array of length P and produces a P-bit fingerprint.
-    /// This results in 2^P partition files.
-    #[arg(short, long)]
+    /// This results in 2^P partition files. (Default: 8)
+    #[arg(short, long, default_value = "8")]
     p: usize,
+
     /// k-mer length. If not provided, k is automatically chosen based on the first 1000 sequences.
     #[arg(short, long)]
     k: Option<usize>,
+
     /// zstd compression level for writing partition files.
     #[arg(short, long, default_value = "4")]
     compression_level: i32,
+
+    /// Final compression algorithm ("zstd" or "gzip"). (Default: "zstd")
+    #[arg(long, default_value = "zstd")]
+    final_compression: String,
+
+    /// Final compression level. For zstd this is typically in the range [1, 22]; for gzip in [0, 9].
+    #[arg(long, default_value = "19")]
+    final_compression_level: i32,
 }
 
 /// A record (FASTA or FASTQ)
@@ -136,14 +150,15 @@ fn generate_gray_code_order(bits: usize) -> Vec<usize> {
 fn auto_detect_k(input: &str) -> std::io::Result<usize> {
     let input_reader = open_input(input);
     let mut buf_reader = BufReader::new(input_reader);
-    let _ = buf_reader.fill_buf()?; // Ensure data is buffered
-    // Peek to detect format.
+    // Ensure data is buffered.
+    let _ = buf_reader.fill_buf()?;
+    // Detect format.
     let peek = buf_reader.fill_buf()?;
     let is_fastq = !peek.is_empty() && peek[0] == b'@';
     let mut max_len = 0;
     let mut count = 0;
     if is_fastq {
-        let mut reader = fastq::Reader::new(buf_reader);
+        let reader = fastq::Reader::new(buf_reader);
         for result in reader.records() {
             let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             let len = record.seq().len();
@@ -156,7 +171,7 @@ fn auto_detect_k(input: &str) -> std::io::Result<usize> {
             }
         }
     } else {
-        let mut reader = fasta::Reader::new(buf_reader);
+        let reader = fasta::Reader::new(buf_reader);
         for result in reader.records() {
             let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             let len = record.seq().len();
@@ -174,42 +189,72 @@ fn auto_detect_k(input: &str) -> std::io::Result<usize> {
     Ok(k.ceil() as usize)
 }
 
-/// Concatenate all partition files (named by binary IDs) in Gray code order.
-/// Each partition file is decompressed on–the–fly and streamed into a final output
-/// that is compressed with zstd (level 19) in parallel.
-fn concatenate_partitions(out_dir: &str, p: usize, final_filename: &str) -> std::io::Result<()> {
-    let num_partitions = 1 << p;
+/// Concatenate all partition files (named by binary IDs) in Gray code order into a final compressed file.
+/// Each partition file is decompressed on–the–fly and streamed into the final output.
+/// The final compression algorithm is chosen based on `final_comp` ("zstd" or "gzip").
+fn concatenate_partitions(
+    out_dir: &str,
+    p: usize,
+    final_filename: &str,
+    final_comp: &str,
+    final_comp_level: i32,
+) -> std::io::Result<()> {
     let gray_order = generate_gray_code_order(p);
     
-    let final_file = File::create(final_filename)?;
-    let mut encoder = Encoder::new(final_file, 19).expect("Cannot create final zstd encoder");
-    // Enable parallel (multithreaded) compression using all available cores.
-    encoder
-        .set_parameter(CParameter::NbWorkers(num_cpus::get() as u32))
-        .expect("Failed to set number of threads");
-    let mut final_writer = BufWriter::new(encoder);
-    
-    for partition in gray_order {
-        let partition_id = format!("{:0width$b}", partition, width = p);
-        let part_filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-        if let Ok(file) = File::open(&part_filename) {
-            let mut decoder = Decoder::new(file).expect("Cannot create zstd decoder for partition");
-            let mut buffer = [0u8; 8192];
-            loop {
-                let n = decoder.read(&mut buffer)?;
-                if n == 0 { break; }
-                final_writer.write_all(&buffer[..n])?;
+    if final_comp.to_lowercase() == "gzip" {
+        // Use gzip final compression.
+        let final_file = File::create(final_filename)?;
+        let gz_encoder = GzEncoder::new(final_file, GzCompression::new(final_comp_level as u32));
+        let mut final_writer = BufWriter::new(gz_encoder);
+        for partition in gray_order {
+            let partition_id = format!("{:0width$b}", partition, width = p);
+            let part_filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+            if let Ok(file) = File::open(&part_filename) {
+                let mut decoder = Decoder::new(file).expect("Cannot create zstd decoder for partition");
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = decoder.read(&mut buffer)?;
+                    if n == 0 { break; }
+                    final_writer.write_all(&buffer[..n])?;
+                }
             }
         }
-    }
-    final_writer.flush()?;
-    match final_writer.into_inner() {
-        Ok(encoder) => {
-            if let Err(e) = encoder.finish() {
-                eprintln!("Error finishing final zstd stream: {}", e);
+        final_writer.flush()?;
+        // Finish gzip compression.
+        let gz_encoder = final_writer.into_inner().expect("Error retrieving inner gzip encoder");
+        gz_encoder.finish()?;
+    } else {
+        // Use zstd final compression.
+        let final_file = File::create(final_filename)?;
+        let mut encoder = Encoder::new(final_file, final_comp_level)
+            .expect("Cannot create final zstd encoder");
+        // Enable parallel (multithreaded) compression.
+        encoder
+            .set_parameter(CParameter::NbWorkers(num_cpus::get() as u32))
+            .expect("Failed to set number of threads");
+        let mut final_writer = BufWriter::new(encoder);
+        for partition in gray_order {
+            let partition_id = format!("{:0width$b}", partition, width = p);
+            let part_filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+            if let Ok(file) = File::open(&part_filename) {
+                let mut decoder = Decoder::new(file).expect("Cannot create zstd decoder for partition");
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = decoder.read(&mut buffer)?;
+                    if n == 0 { break; }
+                    final_writer.write_all(&buffer[..n])?;
+                }
             }
         }
-        Err(_) => eprintln!("Error retrieving inner final zstd encoder"),
+        final_writer.flush()?;
+        match final_writer.into_inner() {
+            Ok(encoder) => {
+                if let Err(e) = encoder.finish() {
+                    eprintln!("Error finishing final zstd stream: {}", e);
+                }
+            }
+            Err(_) => eprintln!("Error retrieving inner final zstd encoder"),
+        }
     }
     Ok(())
 }
@@ -334,8 +379,8 @@ fn main() -> std::io::Result<()> {
     let is_fastq = !peek.is_empty() && peek[0] == b'@';
     
     if is_fastq {
-        let fastq_reader = fastq::Reader::new(buf_reader);
-        for result in fastq_reader.records() {
+        let reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
             let rec = result.expect("Error reading FASTQ record");
             let id = rec.id().to_owned();
             let seq = std::str::from_utf8(rec.seq()).unwrap_or("").to_owned();
@@ -344,8 +389,8 @@ fn main() -> std::io::Result<()> {
             record_tx.send(record).expect("Failed to send record");
         }
     } else {
-        let fasta_reader = fasta::Reader::new(buf_reader);
-        for result in fasta_reader.records() {
+        let reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
             let rec = result.expect("Error reading FASTA record");
             let id = rec.id().to_owned();
             let seq = std::str::from_utf8(rec.seq()).unwrap_or("").to_owned();
@@ -366,7 +411,7 @@ fn main() -> std::io::Result<()> {
     
     // Concatenate partition files (decompress on–the–fly) in Gray code order into final compressed output.
     let final_filename = format!("{}/final.zst", &args.output);
-    concatenate_partitions(&args.output, args.p, &final_filename)?;
+    concatenate_partitions(&args.output, args.p, &final_filename, &args.final_compression, args.final_compression_level)?;
     
     // Remove partition files.
     remove_partition_files(&args.output, args.p);
