@@ -1,5 +1,5 @@
 [package]
-name = "fast_partition"
+name = "Oreo-mini"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,14 +7,15 @@ edition = "2021"
 clap = { version = "4.1", features = ["derive"] }
 bio = "2"  # Use the latest 2.x version
 flate2 = "1.0"
-zstd = "0.11"
+zstd = { version = "0.13", features = ["zstdmt"] }
 tar = "0.4"
 crossbeam-channel = "0.5"
 num_cpus = "1.13"
 
-[profile.release]
+[profile.dev]
 opt-level = 3
-lto = true
-codegen-units = 1
-
-
+debug = false          # remove debug info
+lto = "fat"            # use fat Link-Time Optimization
+codegen-units = 1      # fewer codegen units for better optimization
+panic = "abort"        # use abort to reduce overhead
+incremental = false 

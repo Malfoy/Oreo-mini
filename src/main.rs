@@ -1,57 +1,57 @@
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
 use clap::Parser;
 use bio::io::{fasta, fastq};
 use flate2::read::GzDecoder;
-use zstd::stream::Encoder;
-use tar::Builder;
+use zstd::stream::{Encoder, Decoder};
+use zstd::stream::raw::CParameter;
 use crossbeam_channel;
-use std::sync::Arc;
-use std::io::BufRead;
-
+use num_cpus;
+use std::sync::{Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs::{File, self};
+use std::io::{BufReader, BufWriter, BufRead, Read, Write};
+use std::time::Instant;  // Added for timing
 
 /// Command-line arguments.
 #[derive(Parser)]
 struct Args {
-    /// Input FASTA/FASTQ file (can be gzipped if filename ends with .gz)
+    /// Input FASTA/FASTQ file (.gz or .zst compressed are supported)
     #[arg(short, long)]
     input: String,
-
-    /// Output directory (it will be created if needed)
+    /// Output directory (will be created if needed)
     #[arg(short, long)]
     output: String,
-
-    /// Number of bits (P) used to generate the partition integer.
+    /// Fingerprint bit-length P. The algorithm uses an array of length P and produces a P-bit fingerprint.
+    /// This results in 2^P partition files.
     #[arg(short, long)]
     p: usize,
-
-    /// k-mer length (k)
+    /// k-mer length.
     #[arg(short, long)]
     k: usize,
-
-    /// zstd compression level.
-    #[arg(short, long, default_value = "3")]
+    /// zstd compression level for writing partition files.
+    #[arg(short, long, default_value = "4")]
     compression_level: i32,
 }
 
-/// Represents a sequence record (either FASTA or FASTQ).
+/// A record (FASTA or FASTQ)
 enum Record {
     Fasta { id: String, seq: String },
     Fastq { id: String, seq: String, qual: String },
 }
 
-/// Open an input file, decompressing if the filename ends with ".gz".
+/// Open input file. Supports .gz and .zst.
 fn open_input(path: &str) -> Box<dyn Read> {
     let file = File::open(path).expect("Cannot open input file");
     if path.ends_with(".gz") {
         Box::new(GzDecoder::new(file))
+    } else if path.ends_with(".zst") {
+        let decoder = Decoder::new(file).expect("Cannot create zstd decoder for input");
+        Box::new(decoder)
     } else {
         Box::new(file)
     }
 }
 
-/// Map a nucleotide to a 2-bit value (A->0, C->1, G->2, T->3). Other characters map to 0.
+/// Convert a nucleotide to a 2-bit value (A:0, C:1, G:2, T:3)
 fn nt_to_val(b: u8) -> u64 {
     match b {
         b'A' | b'a' => 0,
@@ -62,94 +62,141 @@ fn nt_to_val(b: u8) -> u64 {
     }
 }
 
-/// A simple 64-bit mix function (based on splitmix64).
-fn mix64(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
-}
-
-/// Update the bucket array for a given k-mer hash.
-/// The most-significant P bits (after a modulo into buckets) are used.
-fn update_bucket(mixed: u64, buckets: &mut [Option<u64>]) {
-    // Use modulo p for bucket index.
-    let idx = (mixed as usize) % buckets.len();
-    match buckets[idx] {
-        Some(current) if mixed < current => buckets[idx] = Some(mixed),
-        None => buckets[idx] = Some(mixed),
-        _ => {}
-    }
-}
-
+/// A 64-bit multiplier for our rolling hash (golden-ratio based)
 const BASE: u64 = 0x9e3779b97f4a7c15;
+
+/// Computes the partition fingerprint for a sequence.
+///
+/// We maintain an array of length P (where P is the fingerprint bit-length). For each k-mer:
+///   1. Compute a 64-bit rolling hash (using BASE to spread the 2-bit nucleotide values).
+///   2. Use the top log₂(P) bits as a bucket index (so if P=8, use 3 bits for an index in 0..7).
+///   3. In that bucket, store the remaining (64 – log₂(P)) bits (keeping only the minimum seen).
+/// Finally, build a fingerprint by concatenating the least-significant bit from each bucket.
+/// The result is a P-bit fingerprint (range 0 … 2^P - 1).
 fn compute_partition(seq: &str, p: usize, k: usize) -> u64 {
-    // p must be a power of two.
-    // Let L = log₂(p) be the number of bits needed to index p buckets.
-    let L = (p as f64).log2() as usize;
-    
-    // Initialize an array of p buckets (each holds an Option<u64> for the minimal "rest-of-hash").
-    let mut buckets: Vec<Option<u64>> = vec![None; p];
-    
+    let buckets_count = p; // use an array of length p
+    let index_bits = (p as f64).log2() as usize; // bits used for bucket index
+    let mut buckets: Vec<Option<u64>> = vec![None; buckets_count];
     let bytes = seq.as_bytes();
     if bytes.len() < k {
-        return 0; // If the sequence is too short, return fingerprint 0.
+        return 0;
     }
-    
-    // Precompute power = BASE^(k-1) mod 2^64 for the rolling update.
+    // Precompute power = BASE^(k-1) for rolling update.
     let mut power: u64 = 1;
     for _ in 0..(k - 1) {
         power = power.wrapping_mul(BASE);
     }
-    
-    // Compute the hash for the first k-mer.
+    // Compute hash for first k-mer.
     let mut hash: u64 = 0;
     for i in 0..k {
         let val = nt_to_val(bytes[i]);
         hash = hash.wrapping_mul(BASE).wrapping_add(val);
     }
     {
-        // Use the top L bits as bucket index.
-        let idx = (hash >> (64 - L)) as usize;
-        // The remaining bits:
-        let value = hash & ((1u64 << (64 - L)) - 1);
+        let idx = (hash >> (64 - index_bits)) as usize;
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
         buckets[idx] = Some(value);
     }
-    
-    // Process subsequent k-mers using the rolling hash update.
+    // Rolling update for subsequent k-mers.
     for i in k..bytes.len() {
         let old_val = nt_to_val(bytes[i - k]);
         let new_val = nt_to_val(bytes[i]);
-        // Remove the contribution of the old nucleotide and add the new one.
         hash = hash.wrapping_sub(old_val.wrapping_mul(power));
         hash = hash.wrapping_mul(BASE).wrapping_add(new_val);
-        let idx = (hash >> (64 - L)) as usize;
-        let value = hash & ((1u64 << (64 - L)) - 1);
+        let idx = (hash >> (64 - index_bits)) as usize;
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
         buckets[idx] = match buckets[idx] {
             Some(current) if value < current => Some(value),
             None => Some(value),
-            other => other, // keep the current minimum.
+            other => other,
         };
     }
-    
-    // Build the final fingerprint by concatenating the least-significant bit from each bucket.
+    // Build fingerprint by concatenating the LSB of each bucket.
     let mut fingerprint = 0;
     for bucket in buckets {
-        // If no value was stored for a bucket, use 0.
         let bit = bucket.unwrap_or(0) & 1;
         fingerprint = (fingerprint << 1) | bit;
     }
     fingerprint
 }
 
-fn main() {
+/// Generate a Gray code sequence for 'bits' bits.
+/// Returns a vector of length 2^(bits) with the Gray code order.
+fn generate_gray_code_order(bits: usize) -> Vec<usize> {
+    let n = 1 << bits;
+    let mut order = Vec::with_capacity(n);
+    for i in 0..n {
+        order.push(i ^ (i >> 1));
+    }
+    order
+}
+
+/// Concatenate all partition files (named by binary IDs) in Gray code order.
+/// Each partition file is decompressed on–the–fly and streamed into a final output
+/// that is compressed with zstd (level 19) in parallel.
+fn concatenate_partitions(out_dir: &str, p: usize, final_filename: &str) -> std::io::Result<()> {
+    let gray_order = generate_gray_code_order(p);
+    
+    let final_file = File::create(final_filename)?;
+    let mut encoder = Encoder::new(final_file, 19).expect("Cannot create final zstd encoder");
+    // Enable parallel (multithreaded) compression using all available cores.
+    encoder
+        .set_parameter(CParameter::NbWorkers(num_cpus::get() as u32))
+        .expect("Failed to set number of threads");
+    let mut final_writer = BufWriter::new(encoder);
+    
+    for partition in gray_order {
+        // File name: binary id (zero-padded, width = p) with extension ".fa.zst"
+        let partition_id = format!("{:0width$b}", partition, width = p);
+        let part_filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+        if let Ok(file) = File::open(&part_filename) {
+            let mut decoder = Decoder::new(file).expect("Cannot create zstd decoder for partition");
+            let mut buffer = [0u8; 8192];
+            loop {
+                let n = decoder.read(&mut buffer)?;
+                if n == 0 { break; }
+                final_writer.write_all(&buffer[..n])?;
+            }
+        }
+    }
+    final_writer.flush()?;
+    match final_writer.into_inner() {
+        Ok(encoder) => {
+            if let Err(e) = encoder.finish() {
+                eprintln!("Error finishing final zstd stream: {}", e);
+            }
+        }
+        Err(_) => eprintln!("Error retrieving inner final zstd encoder"),
+    }
+    Ok(())
+}
+
+/// Remove partition files after final concatenation.
+fn remove_partition_files(out_dir: &str, p: usize) {
+    let num_partitions = 1 << p;
+    for i in 0..num_partitions {
+        let partition_id = format!("{:0width$b}", i, width = p);
+        let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+        if let Err(e) = fs::remove_file(&filename) {
+            eprintln!("Warning: could not remove {}: {}", filename, e);
+        }
+    }
+}
+
+fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    let start = Instant::now(); // Start timing
 
-    // Create output directory if it does not exist.
-    std::fs::create_dir_all(&args.output).expect("Cannot create output directory");
-
+    // Create output directory if needed.
+    fs::create_dir_all(&args.output).expect("Cannot create output directory");
+    
+    // Atomic counter for total nucleotides processed.
+    let nucleotide_count = Arc::new(AtomicU64::new(0));
+    
+    // Number of partition files is 2^(fingerprint bit-length).
     let num_partitions = 1 << args.p;
-
-    // Create partition channels (one per partition) for sending records to writer threads.
+    
+    // Create channels for partitioning.
     let mut partition_senders = Vec::with_capacity(num_partitions);
     let mut partition_receivers = Vec::with_capacity(num_partitions);
     for _ in 0..num_partitions {
@@ -157,57 +204,52 @@ fn main() {
         partition_senders.push(tx);
         partition_receivers.push(rx);
     }
-
-    // Open input and determine format.
-    let input = open_input(&args.input);
-    let mut buf_reader = BufReader::new(input);
-    let peek = buf_reader.fill_buf().expect("Error reading input");
-    let is_fastq = !peek.is_empty() && peek[0] == b'@';
-    let out_ext = if is_fastq { "fq" } else { "fa" };
-
-    // Spawn writer threads—each owns its zstd-compressed output file.
+    
+    // Spawn writer threads—each writes one partition file.
+    let out_dir = args.output.clone();
     let mut writer_handles = Vec::with_capacity(num_partitions);
     for i in 0..num_partitions {
-        // Take the corresponding receiver.
+        let partition_id = format!("{:0width$b}", i, width = args.p);
+        let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
         let rx = partition_receivers.remove(0);
-        let filename = format!("{}/partition_{}.{}", args.output, i, out_ext);
-        let file = File::create(&filename)
-            .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename, e));
-        let encoder = Encoder::new(file, args.compression_level)
-            .expect("Cannot create zstd encoder");
+        let compression_level = args.compression_level;
         let handle = std::thread::spawn(move || {
+            let file = File::create(&filename)
+                .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename, e));
+            let encoder = Encoder::new(file, compression_level)
+                .expect("Cannot create zstd encoder for partition");
             let mut writer = BufWriter::new(encoder);
             while let Ok(record) = rx.recv() {
                 match record {
                     Record::Fasta { id, seq } => {
                         writeln!(writer, ">{}", id).expect("Write error");
                         writeln!(writer, "{}", seq).expect("Write error");
-                    },
+                    }
                     Record::Fastq { id, seq, qual } => {
                         writeln!(writer, "@{}", id).expect("Write error");
                         writeln!(writer, "{}", seq).expect("Write error");
                         writeln!(writer, "+").expect("Write error");
                         writeln!(writer, "{}", qual).expect("Write error");
-                    },
+                    }
                 }
             }
             writer.flush().expect("Flush error");
             match writer.into_inner() {
                 Ok(encoder) => {
                     if let Err(e) = encoder.finish() {
-                        eprintln!("Error finishing zstd stream: {}", e);
+                        eprintln!("Error finishing partition zstd stream: {}", e);
                     }
                 }
-                Err(_) => eprintln!("Error retrieving inner zstd encoder"),
+                Err(_) => eprintln!("Error retrieving inner encoder for partition"),
             }
         });
         writer_handles.push(handle);
     }
-
-    // Create a channel for sending records from the input reader to worker threads.
+    
+    // Create a channel for sending records to worker threads.
     let (record_tx, record_rx) = crossbeam_channel::bounded::<Record>(100);
-
-    // Spawn worker threads (number = available CPUs).
+    
+    // Spawn worker threads (one per available CPU).
     let num_workers = num_cpus::get();
     let partition_senders = Arc::new(partition_senders);
     let worker_handles: Vec<_> = (0..num_workers)
@@ -216,26 +258,31 @@ fn main() {
             let partition_senders = Arc::clone(&partition_senders);
             let p = args.p;
             let k = args.k;
+            let nucleotide_count = Arc::clone(&nucleotide_count);
             std::thread::spawn(move || {
                 while let Ok(record) = record_rx.recv() {
                     let seq = match &record {
                         Record::Fasta { seq, .. } => seq,
                         Record::Fastq { seq, .. } => seq,
                     };
-                    let partition = compute_partition(seq, p, k);
-                    // println!("{}",partition);
-                    // Send the record to its designated partition channel.
-                    partition_senders[partition as usize]
+                    nucleotide_count.fetch_add(seq.len() as u64, Ordering::Relaxed);
+                    let fingerprint = compute_partition(seq, p, k);
+                    partition_senders[fingerprint as usize]
                         .send(record)
                         .expect("Failed to send record to partition");
                 }
             })
         })
         .collect();
-
-    // Read the input file and send records into the worker channel.
+    
+    // Open input file and detect format (peeking without consuming).
+    let input = open_input(&args.input);
+    let mut buf_reader = BufReader::new(input);
+    let peek = buf_reader.fill_buf().expect("Error peeking input");
+    let is_fastq = !peek.is_empty() && peek[0] == b'@';
+    
     if is_fastq {
-        let mut fastq_reader = fastq::Reader::new(buf_reader);
+        let fastq_reader = fastq::Reader::new(buf_reader);
         for result in fastq_reader.records() {
             let rec = result.expect("Error reading FASTQ record");
             let id = rec.id().to_owned();
@@ -245,7 +292,7 @@ fn main() {
             record_tx.send(record).expect("Failed to send record");
         }
     } else {
-        let mut fasta_reader = fasta::Reader::new(buf_reader);
+        let fasta_reader = fasta::Reader::new(buf_reader);
         for result in fasta_reader.records() {
             let rec = result.expect("Error reading FASTA record");
             let id = rec.id().to_owned();
@@ -254,29 +301,50 @@ fn main() {
             record_tx.send(record).expect("Failed to send record");
         }
     }
-    // Signal no more records.
     drop(record_tx);
-
-    // Wait for all worker threads to finish.
+    
     for handle in worker_handles {
         handle.join().expect("Worker thread panicked");
     }
-    // Dropping the Arc of partition_senders will eventually close all senders.
     drop(partition_senders);
-
-    // Wait for all writer threads to finish.
+    
     for handle in writer_handles {
         handle.join().expect("Writer thread panicked");
     }
-
-    // Finally, create a tar archive containing all partition files.
-    let tar_filename = format!("partitions.tar");
-    let tar_file = File::create(&tar_filename).expect("Cannot create tar archive");
-    let mut tar_builder = Builder::new(tar_file);
-    tar_builder
-        .append_dir_all("partitions", &args.output)
-        .expect("Error creating tar archive");
-    tar_builder.finish().expect("Error finishing tar archive");
-
-    println!("Processing complete. Tar archive created at: {}", tar_filename);
+    
+    // Concatenate partition files (decompress on–the–fly) in Gray code order into final compressed output.
+    let final_filename = format!("{}/final.zst", &args.output);
+    concatenate_partitions(&args.output, args.p, &final_filename)?;
+    
+    // Remove partition files.
+    remove_partition_files(&args.output, args.p);
+    
+    // Retrieve statistics.
+    let total_nucleotides = nucleotide_count.load(Ordering::Relaxed);
+    let final_meta = fs::metadata(&final_filename)?;
+    let final_size = final_meta.len(); // bytes
+    let total_nucleotides_millions = total_nucleotides as f64 / 1_000_000.0;
+    let final_size_mb = final_size as f64 / (1024.0 * 1024.0);
+    let bits_per_nucleotide = if total_nucleotides > 0 {
+        (final_size as f64 * 8.0) / (total_nucleotides as f64)
+    } else {
+        0.0
+    };
+    
+    let elapsed = start.elapsed();  // Compute runtime
+    let seconds = elapsed.as_secs_f64();
+    let throughput = if seconds > 0.0 {
+        (total_nucleotides as f64 / 1_000_000.0) / seconds
+    } else {
+        0.0
+    };
+    
+    println!("Total nucleotides compressed: {:.3} million", total_nucleotides_millions);
+    println!("Final archive size: {:.3} MB", final_size_mb);
+    println!("Effective bits per nucleotide: {:.3}", bits_per_nucleotide);
+    println!("Run time: {:.3} seconds", seconds);
+    println!("Throughput: {:.3} million nucleotides/second", throughput);
+    println!("Final compressed file: {}", final_filename);
+    
+    Ok(())
 }
