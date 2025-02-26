@@ -9,7 +9,7 @@ use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{File, self};
 use std::io::{BufReader, BufWriter, BufRead, Read, Write};
-use std::time::Instant;  // Added for timing
+use std::time::Instant;
 
 /// Command-line arguments.
 #[derive(Parser)]
@@ -24,9 +24,9 @@ struct Args {
     /// This results in 2^P partition files.
     #[arg(short, long)]
     p: usize,
-    /// k-mer length.
+    /// k-mer length. If not provided, k is automatically chosen based on the first 1000 sequences.
     #[arg(short, long)]
-    k: usize,
+    k: Option<usize>,
     /// zstd compression level for writing partition files.
     #[arg(short, long, default_value = "4")]
     compression_level: i32,
@@ -131,10 +131,54 @@ fn generate_gray_code_order(bits: usize) -> Vec<usize> {
     order
 }
 
+/// Reads up to the first 1000 records from the input file (FASTA or FASTQ),
+/// finds the longest read length L, and returns the smallest k such that 4^k >= 10 * L.
+fn auto_detect_k(input: &str) -> std::io::Result<usize> {
+    let input_reader = open_input(input);
+    let mut buf_reader = BufReader::new(input_reader);
+    let _ = buf_reader.fill_buf()?; // Ensure data is buffered
+    // Peek to detect format.
+    let peek = buf_reader.fill_buf()?;
+    let is_fastq = !peek.is_empty() && peek[0] == b'@';
+    let mut max_len = 0;
+    let mut count = 0;
+    if is_fastq {
+        let mut reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
+            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let len = record.seq().len();
+            if len > max_len {
+                max_len = len;
+            }
+            count += 1;
+            if count >= 1000 {
+                break;
+            }
+        }
+    } else {
+        let mut reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
+            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let len = record.seq().len();
+            if len > max_len {
+                max_len = len;
+            }
+            count += 1;
+            if count >= 1000 {
+                break;
+            }
+        }
+    }
+    let threshold = 10 * max_len;
+    let k = (threshold as f64).ln() / 4f64.ln();
+    Ok(k.ceil() as usize)
+}
+
 /// Concatenate all partition files (named by binary IDs) in Gray code order.
 /// Each partition file is decompressed on–the–fly and streamed into a final output
 /// that is compressed with zstd (level 19) in parallel.
 fn concatenate_partitions(out_dir: &str, p: usize, final_filename: &str) -> std::io::Result<()> {
+    let num_partitions = 1 << p;
     let gray_order = generate_gray_code_order(p);
     
     let final_file = File::create(final_filename)?;
@@ -146,7 +190,6 @@ fn concatenate_partitions(out_dir: &str, p: usize, final_filename: &str) -> std:
     let mut final_writer = BufWriter::new(encoder);
     
     for partition in gray_order {
-        // File name: binary id (zero-padded, width = p) with extension ".fa.zst"
         let partition_id = format!("{:0width$b}", partition, width = p);
         let part_filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
         if let Ok(file) = File::open(&part_filename) {
@@ -185,16 +228,25 @@ fn remove_partition_files(out_dir: &str, p: usize) {
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-    let start = Instant::now(); // Start timing
+    let start = Instant::now(); // Start runtime timer
 
     // Create output directory if needed.
     fs::create_dir_all(&args.output).expect("Cannot create output directory");
     
+    // Determine k-mer length.
+    let k = match args.k {
+        Some(val) => val,
+        None => {
+            let detected = auto_detect_k(&args.input)?;
+            println!("Auto-detected k = {}", detected);
+            detected
+        }
+    };
+    
     // Atomic counter for total nucleotides processed.
     let nucleotide_count = Arc::new(AtomicU64::new(0));
     
-    // Number of partition files is 2^(fingerprint bit-length).
-    let num_partitions = 1 << args.p;
+    let num_partitions = 1 << args.p; // Number of partition files.
     
     // Create channels for partitioning.
     let mut partition_senders = Vec::with_capacity(num_partitions);
@@ -257,7 +309,7 @@ fn main() -> std::io::Result<()> {
             let record_rx = record_rx.clone();
             let partition_senders = Arc::clone(&partition_senders);
             let p = args.p;
-            let k = args.k;
+            let k = k;
             let nucleotide_count = Arc::clone(&nucleotide_count);
             std::thread::spawn(move || {
                 while let Ok(record) = record_rx.recv() {
@@ -331,14 +383,15 @@ fn main() -> std::io::Result<()> {
         0.0
     };
     
-    let elapsed = start.elapsed();  // Compute runtime
+    let elapsed = start.elapsed();
     let seconds = elapsed.as_secs_f64();
     let throughput = if seconds > 0.0 {
-        (total_nucleotides as f64 / 1_000_000.0) / seconds
+        total_nucleotides_millions / seconds
     } else {
         0.0
     };
     
+    println!("Processing complete.");
     println!("Total nucleotides compressed: {:.3} million", total_nucleotides_millions);
     println!("Final archive size: {:.3} MB", final_size_mb);
     println!("Effective bits per nucleotide: {:.3}", bits_per_nucleotide);
