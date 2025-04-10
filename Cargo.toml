@@ -11,7 +11,9 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 tar = "0.4"
 crossbeam-channel = "0.5"
 num_cpus = "1.13"
+
 rayon = "1.8"
+nthash = "0.5.1"
 
 [profile.dev]
 opt-level = 3

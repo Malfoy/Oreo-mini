@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+use nthash::NtHashIterator;
+
 /// Command-line arguments.
 #[derive(Parser)]
 struct Args {
@@ -129,6 +131,31 @@ fn compute_partition(seq: &str, p: usize, k: usize, base: u64) -> u64 {
         let new_val = nt_to_val(bytes[i]);
         hash = hash.wrapping_sub(old_val.wrapping_mul(power));
         hash = hash.wrapping_mul(base).wrapping_add(new_val);
+        let idx = (hash >> (64 - index_bits)) as usize;
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        buckets[idx] = Some(match buckets[idx] {
+            Some(current) if value > current => current,
+            _ => value,
+        });
+    }
+    let mut fingerprint = 0;
+    for bucket in buckets {
+        let bit = bucket.unwrap_or(0) & 1;
+        fingerprint = (fingerprint << 1) | bit;
+    }
+    fingerprint & ((1 << p) -1 )
+}
+
+
+fn compute_partition_canonique(seq: &str, p: usize, k: usize, base: u64) -> u64 {
+    let seq_bytes = seq.as_bytes();
+    let index_bits = (p as f64).log2().ceil() as usize;
+    let buckets_count = 1 << index_bits; // use an array of length p
+    let mut buckets: Vec<Option<u64>> = vec![None; buckets_count];
+
+    let iter = NtHashIterator::new(seq_bytes, k).expect("NtHash problem");
+    for it in iter {
+        let hash = it.wrapping_mul(base);
         let idx = (hash >> (64 - index_bits)) as usize;
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
         buckets[idx] = Some(match buckets[idx] {
@@ -331,7 +358,22 @@ fn update_rc_file(input: &str, k: usize) {
             let seqrc = reverse_complement(&seq);
             let score = score_kmers(&seq, k, &mut kmer_map);
             let score_rc = score_kmers(&seqrc, k, &mut kmer_map);
-            println!("{} - {}",score,score_rc);
+            // println!("{} - {}",score,score_rc);
+            if score > score_rc {
+                writeln!(writer, "@{}", id).expect("Write error");
+                writeln!(writer, "{}", seq).expect("Write error");
+                writeln!(writer, "+").expect("Write error");
+                writeln!(writer, "{}", qual).expect("Write error");
+            } else {
+                writeln!(writer, "@{}", id).expect("Write error");
+                writeln!(writer, "{}", seqrc).expect("Write error");
+                writeln!(writer, "+").expect("Write error");
+                writeln!(writer, "{}", qual).expect("Write error");
+                // TODO reverse quality
+                remove_kmers(&seq, k, &mut kmer_map);
+                collect_kmers(&seqrc, k, &mut kmer_map);
+                // println!("Flip");
+            }
         }
     } else {
         let reader = fasta::Reader::new(buf_reader);
@@ -351,7 +393,7 @@ fn update_rc_file(input: &str, k: usize) {
                 writeln!(writer, "{}", seqrc).expect("Write error");
                 remove_kmers(&seq, k, &mut kmer_map);
                 collect_kmers(&seqrc, k, &mut kmer_map);
-                // println!("Flip ########");
+                // print!(".");
             }
         }
 
@@ -508,7 +550,12 @@ fn main() -> std::io::Result<()> {
                         Record::Fasta { seq, .. } => (seq, false),
                         Record::Fastq { seq, .. } => (seq, true),
                     };
-                    let fp2 = compute_partition(seq, p, k, BASE2) as usize;
+                    let fp2;
+                    if args.rc_sensitivity {
+                        fp2 = compute_partition_canonique(seq, p, k, BASE2) as usize;
+                    } else {
+                        fp2 = compute_partition(seq, p, k, BASE2) as usize;
+                    }
                     subpartitions[fp2].push(record);
                 }
                 let file = File::create(&filename)
@@ -596,12 +643,7 @@ fn main() -> std::io::Result<()> {
                     // let fp = compute_partition(seq, p, k, BASE1);
                     let fp;
                     if args.rc_sensitivity {
-                        let seqrc = reverse_complement(seq);
-                        if &seqrc < seq {
-                            fp = compute_partition(&seqrc, p, k, BASE1);
-                        } else {
-                            fp = compute_partition(seq, p, k, BASE1);
-                        }
+                        fp = compute_partition_canonique(seq, p, k, BASE1);
                     } else {
                         fp = compute_partition(seq, p, k, BASE1);
                     }
@@ -663,7 +705,8 @@ fn main() -> std::io::Result<()> {
             let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
             // println!("{}", filename);
 
-            for x in 1..args.rc_compression_loop{
+            for _ in 0..args.rc_compression_loop{
+                // println!("{}",x);
                 update_rc_file(&filename, k);
             }
 
@@ -679,7 +722,7 @@ fn main() -> std::io::Result<()> {
         args.final_compression_level,
     )?;
 
-    // remove_partition_files(&args.output, args.p);
+    remove_partition_files(&args.output, args.p);
 
     let total_nucleotides = nucleotide_count.load(Ordering::Relaxed);
     let final_meta = fs::metadata(&final_filename)?;
