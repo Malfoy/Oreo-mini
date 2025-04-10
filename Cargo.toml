@@ -11,6 +11,7 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 tar = "0.4"
 crossbeam-channel = "0.5"
 num_cpus = "1.13"
+rayon = "1.8"
 
 [profile.dev]
 opt-level = 3
@@ -18,4 +19,4 @@ debug = false          # remove debug info
 lto = "fat"            # use fat Link-Time Optimization
 codegen-units = 1      # fewer codegen units for better optimization
 panic = "abort"        # use abort to reduce overhead
-incremental = false 
+incremental = false

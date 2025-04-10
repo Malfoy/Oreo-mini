@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{File, self};
 use std::io::{BufReader, BufWriter, BufRead, Read, Write};
 use std::time::Instant;
+use std::collections::HashMap;
+
+use rayon::prelude::*;
 
 /// Command-line arguments.
 #[derive(Parser)]
@@ -48,6 +51,13 @@ struct Args {
     /// Enable second-level partitioning + reordering (using a different hash function, same p/k).
     #[arg(long)]
     second_level: bool,
+
+    /// Enable reverse complement sensitivity
+    #[arg(long)]
+    rc_sensitivity: bool,
+
+    #[arg(long, default_value = "1")]
+    rc_compression_loop: i32,
 }
 
 /// A record (FASTA or FASTQ)
@@ -91,8 +101,8 @@ const BASE2: u64 = 0xc2b2ae3d27d4eb4f;
 ///   3. Keep the min hashed value in each bucket.
 /// Then build the P-bit fingerprint from the LSBs of each bucket.
 fn compute_partition(seq: &str, p: usize, k: usize, base: u64) -> u64 {
-    let buckets_count = p;
-    let index_bits = (p as f64).log2() as usize;
+    let index_bits = (p as f64).log2().ceil() as usize; // bits used for bucket index
+    let buckets_count = 1 << index_bits; // use an array of length p
     let mut buckets: Vec<Option<u64>> = vec![None; buckets_count];
     let bytes = seq.as_bytes();
     if bytes.len() < k {
@@ -131,7 +141,7 @@ fn compute_partition(seq: &str, p: usize, k: usize, base: u64) -> u64 {
         let bit = bucket.unwrap_or(0) & 1;
         fingerprint = (fingerprint << 1) | bit;
     }
-    fingerprint
+    fingerprint & ((1 << p) -1 )
 }
 
 /// Generate a Gray code sequence for 'bits' bits.
@@ -262,6 +272,194 @@ fn remove_partition_files(out_dir: &str, p: usize) {
         }
     }
 }
+
+fn reverse_complement(dna: &str) -> String {
+    dna.chars()
+        .rev() // On inverse la séquence
+        .map(|n| match n {
+            'A' => 'T',
+            'T' => 'A',
+            'C' => 'G',
+            'G' => 'C',
+            _ => n, // Si un caractère inconnu est rencontré, on le laisse inchangé
+        })
+        .collect()
+}
+
+fn update_rc_file(input: &str, k: usize) {
+    // println!("New input");
+    let mut input_reader = open_input(input);
+    let mut buf_reader = BufReader::new(input_reader);
+
+    let peek = buf_reader.fill_buf().expect("Error peeking input");
+    let is_fastq = !peek.is_empty() && peek[0] == b'@';
+
+    let mut kmer_map: HashMap<u64, usize> = HashMap::new();
+
+    if is_fastq {
+        let reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
+            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTQ reading");
+            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
+            collect_kmers(&seq, k, &mut kmer_map);
+        }
+    } else {
+        let reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
+            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTA reading");
+            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
+            collect_kmers(&seq, k, &mut kmer_map);
+        }
+    }
+
+    input_reader = open_input(input);
+    buf_reader = BufReader::new(input_reader);
+    let input_temp = input.to_owned()+".temp";
+    let file = File::create(input_temp.clone())
+        .unwrap_or_else(|e| panic!("Cannot create {}: {}", input.to_owned()+".temp", e));
+    let encoder = Encoder::new(file, 4)
+        .expect("Cannot create zstd encoder for partition");
+    let mut writer = BufWriter::new(encoder);
+
+    if is_fastq {
+        let reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
+            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTQ reading");
+            let id = record.id().to_owned();
+            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
+            let qual = std::str::from_utf8(record.qual()).unwrap_or("").to_owned();
+            let seqrc = reverse_complement(&seq);
+            let score = score_kmers(&seq, k, &mut kmer_map);
+            let score_rc = score_kmers(&seqrc, k, &mut kmer_map);
+            println!("{} - {}",score,score_rc);
+        }
+    } else {
+        let reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
+            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTA reading");
+            let id = record.id().to_owned();
+            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
+            let seqrc = reverse_complement(&seq);
+            let score = score_kmers(&seq, k, &mut kmer_map);
+            let score_rc = score_kmers(&seqrc, k, &mut kmer_map);
+            // println!("{} - {}",score,score_rc);
+            if score > score_rc {
+                writeln!(writer, ">{}", id).expect("Write error");
+                writeln!(writer, "{}", seq).expect("Write error");
+            } else {
+                writeln!(writer, ">{}", id).expect("Write error");
+                writeln!(writer, "{}", seqrc).expect("Write error");
+                remove_kmers(&seq, k, &mut kmer_map);
+                collect_kmers(&seqrc, k, &mut kmer_map);
+                // println!("Flip ########");
+            }
+        }
+
+        writer.flush().expect("Flush error");
+        match writer.into_inner() {
+            Ok(encoder) => {
+                if let Err(e) = encoder.finish() {
+                    eprintln!("Error finishing partition zstd stream: {}", e);
+                }
+            }
+            Err(_) => eprintln!("Error retrieving inner encoder for partition"),
+        }
+        fs::rename(input_temp, input).expect("Error rename");
+    }
+
+}
+
+fn collect_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) {
+    let base = BASE1;
+    let index_bits = k;
+    let bytes = seq.as_bytes();
+    if bytes.len() < k {
+        return;
+    }
+    let mut power: u64 = 1;
+    for _ in 0..(k - 1) {
+        power = power.wrapping_mul(base);
+    }
+    let mut hash: u64 = 0;
+    for i in 0..k {
+        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
+    }
+    {
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        *kmer_map.entry(value).or_insert(0) += 1;
+    }
+    for i in k..bytes.len() {
+        let old_val = nt_to_val(bytes[i - k]);
+        let new_val = nt_to_val(bytes[i]);
+        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
+        hash = hash.wrapping_mul(base).wrapping_add(new_val);
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        *kmer_map.entry(value).or_insert(0) += 1;
+    }
+}
+
+fn score_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) -> usize {
+    let base = BASE1;
+    let index_bits = k;
+    let bytes = seq.as_bytes();
+    let mut score = 0;
+    if bytes.len() < k {
+        return 0;
+    }
+    let mut power: u64 = 1;
+    for _ in 0..(k - 1) {
+        power = power.wrapping_mul(base);
+    }
+    let mut hash: u64 = 0;
+    for i in 0..k {
+        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
+    }
+    {
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        *kmer_map.entry(value).or_insert(0) += 1;
+        score += kmer_map.get(&value).copied().unwrap_or(0);
+    }
+    for i in k..bytes.len() {
+        let old_val = nt_to_val(bytes[i - k]);
+        let new_val = nt_to_val(bytes[i]);
+        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
+        hash = hash.wrapping_mul(base).wrapping_add(new_val);
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        score += kmer_map.get(&value).copied().unwrap_or(0);
+    }
+    score
+}
+
+fn remove_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) {
+    let base = BASE1;
+    let index_bits = k;
+    let bytes = seq.as_bytes();
+    if bytes.len() < k {
+        return;
+    }
+    let mut power: u64 = 1;
+    for _ in 0..(k - 1) {
+        power = power.wrapping_mul(base);
+    }
+    let mut hash: u64 = 0;
+    for i in 0..k {
+        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
+    }
+    {
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        *kmer_map.entry(value).or_insert(0) -= 1;
+    }
+    for i in k..bytes.len() {
+        let old_val = nt_to_val(bytes[i - k]);
+        let new_val = nt_to_val(bytes[i]);
+        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
+        hash = hash.wrapping_mul(base).wrapping_add(new_val);
+        let value = hash & ((1u64 << (64 - index_bits)) - 1);
+        *kmer_map.entry(value).or_insert(0) -= 1;
+    }
+}
+
+
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -395,7 +593,18 @@ fn main() -> std::io::Result<()> {
                         Record::Fastq { seq, .. } => seq,
                     };
                     nucleotide_count.fetch_add(seq.len() as u64, Ordering::Relaxed);
-                    let fp = compute_partition(seq, p, k, BASE1);
+                    // let fp = compute_partition(seq, p, k, BASE1);
+                    let fp;
+                    if args.rc_sensitivity {
+                        let seqrc = reverse_complement(seq);
+                        if &seqrc < seq {
+                            fp = compute_partition(&seqrc, p, k, BASE1);
+                        } else {
+                            fp = compute_partition(seq, p, k, BASE1);
+                        }
+                    } else {
+                        fp = compute_partition(seq, p, k, BASE1);
+                    }
                     partition_senders[fp as usize]
                         .send(record)
                         .expect("Failed to send record to partition");
@@ -438,6 +647,29 @@ fn main() -> std::io::Result<()> {
         handle.join().expect("Writer thread panicked");
     }
 
+    if args.rc_sensitivity {
+        // for i in 0..num_partitions {
+        //     let partition_id = format!("{:0width$b}", i, width = args.p);
+        //     let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+        //     println!("{}",filename);
+        //     for _ in 0..args.rc_compression_loop {
+        //         update_rc_file(&filename, k);
+        //     }
+        //
+        //     break;
+        // }
+        (0..num_partitions).into_par_iter().for_each(|i| {
+            let partition_id = format!("{:0width$b}", i, width = args.p);
+            let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+            // println!("{}", filename);
+
+            for x in 1..args.rc_compression_loop{
+                update_rc_file(&filename, k);
+            }
+
+        });
+    }
+
     let final_filename = format!("{}/final.zst", &args.output);
     concatenate_partitions(
         &args.output,
@@ -447,7 +679,7 @@ fn main() -> std::io::Result<()> {
         args.final_compression_level,
     )?;
 
-    remove_partition_files(&args.output, args.p);
+    // remove_partition_files(&args.output, args.p);
 
     let total_nucleotides = nucleotide_count.load(Ordering::Relaxed);
     let final_meta = fs::metadata(&final_filename)?;
