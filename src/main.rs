@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{File, self};
 use std::io::{BufReader, BufWriter, BufRead, Read, Write};
 use std::time::Instant;
-use std::collections::HashMap;
 
 use rayon::prelude::*;
 
@@ -314,30 +313,39 @@ fn reverse_complement(dna: &str) -> String {
 }
 
 fn update_rc_file(input: &str, k: usize) {
-    // println!("New input");
     let mut input_reader = open_input(input);
     let mut buf_reader = BufReader::new(input_reader);
 
     let peek = buf_reader.fill_buf().expect("Error peeking input");
     let is_fastq = !peek.is_empty() && peek[0] == b'@';
 
-    let mut kmer_map: HashMap<u64, usize> = HashMap::new();
+    let taille = 1 << 2*k;
+    let mut kmer_array: Vec<u64> = vec![0; taille];
+
+    let incr = |t: &mut Vec<u64>, s:usize| {
+        t[s] += 1
+    };
+
+    let decr = |t: &mut Vec<u64>, s:usize| {
+        t[s] -= 1
+    };
 
     if is_fastq {
         let reader = fastq::Reader::new(buf_reader);
         for result in reader.records() {
             let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTQ reading");
             let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
-            collect_kmers(&seq, k, &mut kmer_map);
+            update_kmer_array(&seq, k, &mut kmer_array, incr);
         }
     } else {
         let reader = fasta::Reader::new(buf_reader);
         for result in reader.records() {
             let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTA reading");
             let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
-            collect_kmers(&seq, k, &mut kmer_map);
+            update_kmer_array(&seq, k, &mut kmer_array, incr);
         }
     }
+
 
     input_reader = open_input(input);
     buf_reader = BufReader::new(input_reader);
@@ -356,8 +364,8 @@ fn update_rc_file(input: &str, k: usize) {
             let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
             let qual = std::str::from_utf8(record.qual()).unwrap_or("").to_owned();
             let seqrc = reverse_complement(&seq);
-            let score = score_kmers(&seq, k, &mut kmer_map);
-            let score_rc = score_kmers(&seqrc, k, &mut kmer_map);
+            let score = score_kmer_array(&seq, k, &mut kmer_array);
+            let score_rc = score_kmer_array(&seqrc, k, &mut kmer_array);
             // println!("{} - {}",score,score_rc);
             if score > score_rc {
                 writeln!(writer, "@{}", id).expect("Write error");
@@ -370,8 +378,8 @@ fn update_rc_file(input: &str, k: usize) {
                 writeln!(writer, "+").expect("Write error");
                 writeln!(writer, "{}", qual).expect("Write error");
                 // TODO reverse quality
-                remove_kmers(&seq, k, &mut kmer_map);
-                collect_kmers(&seqrc, k, &mut kmer_map);
+                update_kmer_array(&seq, k, &mut kmer_array, decr);
+                update_kmer_array(&seqrc, k, &mut kmer_array, incr);
                 // println!("Flip");
             }
         }
@@ -382,17 +390,16 @@ fn update_rc_file(input: &str, k: usize) {
             let id = record.id().to_owned();
             let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
             let seqrc = reverse_complement(&seq);
-            let score = score_kmers(&seq, k, &mut kmer_map);
-            let score_rc = score_kmers(&seqrc, k, &mut kmer_map);
-            // println!("{} - {}",score,score_rc);
+            let score = score_kmer_array(&seq, k, &mut kmer_array);
+            let score_rc = score_kmer_array(&seqrc, k, &mut kmer_array);
             if score > score_rc {
                 writeln!(writer, ">{}", id).expect("Write error");
                 writeln!(writer, "{}", seq).expect("Write error");
             } else {
                 writeln!(writer, ">{}", id).expect("Write error");
                 writeln!(writer, "{}", seqrc).expect("Write error");
-                remove_kmers(&seq, k, &mut kmer_map);
-                collect_kmers(&seqrc, k, &mut kmer_map);
+                update_kmer_array(&seq, k, &mut kmer_array, decr);
+                update_kmer_array(&seqrc, k, &mut kmer_array, incr);
                 // print!(".");
             }
         }
@@ -411,8 +418,11 @@ fn update_rc_file(input: &str, k: usize) {
 
 }
 
-fn collect_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) {
-    let base = BASE1;
+fn update_kmer_array<F>(seq: &str, k: usize, kmer_array: &mut Vec<u64>, mut f: F)
+where
+    F: FnMut(&mut Vec<u64>, usize)
+{
+    let base = 4;
     let index_bits = k;
     let bytes = seq.as_bytes();
     if bytes.len() < k {
@@ -428,7 +438,7 @@ fn collect_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) {
     }
     {
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        *kmer_map.entry(value).or_insert(0) += 1;
+        f(kmer_array,value as usize);
     }
     for i in k..bytes.len() {
         let old_val = nt_to_val(bytes[i - k]);
@@ -436,12 +446,12 @@ fn collect_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) {
         hash = hash.wrapping_sub(old_val.wrapping_mul(power));
         hash = hash.wrapping_mul(base).wrapping_add(new_val);
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        *kmer_map.entry(value).or_insert(0) += 1;
+        f(kmer_array,value  as usize);
     }
 }
 
-fn score_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) -> usize {
-    let base = BASE1;
+fn score_kmer_array(seq: &str, k: usize, kmer_array: &mut Vec<u64>) -> u64 {
+    let base = 4;
     let index_bits = k;
     let bytes = seq.as_bytes();
     let mut score = 0;
@@ -458,8 +468,7 @@ fn score_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) -> usize
     }
     {
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        *kmer_map.entry(value).or_insert(0) += 1;
-        score += kmer_map.get(&value).copied().unwrap_or(0);
+        score += kmer_array[value as usize];
     }
     for i in k..bytes.len() {
         let old_val = nt_to_val(bytes[i - k]);
@@ -467,40 +476,10 @@ fn score_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) -> usize
         hash = hash.wrapping_sub(old_val.wrapping_mul(power));
         hash = hash.wrapping_mul(base).wrapping_add(new_val);
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        score += kmer_map.get(&value).copied().unwrap_or(0);
+        score += kmer_array[value as usize];
     }
     score
 }
-
-fn remove_kmers(seq: &str, k: usize, kmer_map: &mut HashMap<u64, usize>) {
-    let base = BASE1;
-    let index_bits = k;
-    let bytes = seq.as_bytes();
-    if bytes.len() < k {
-        return;
-    }
-    let mut power: u64 = 1;
-    for _ in 0..(k - 1) {
-        power = power.wrapping_mul(base);
-    }
-    let mut hash: u64 = 0;
-    for i in 0..k {
-        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
-    }
-    {
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        *kmer_map.entry(value).or_insert(0) -= 1;
-    }
-    for i in k..bytes.len() {
-        let old_val = nt_to_val(bytes[i - k]);
-        let new_val = nt_to_val(bytes[i]);
-        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
-        hash = hash.wrapping_mul(base).wrapping_add(new_val);
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        *kmer_map.entry(value).or_insert(0) -= 1;
-    }
-}
-
 
 
 fn main() -> std::io::Result<()> {
@@ -689,6 +668,7 @@ fn main() -> std::io::Result<()> {
         handle.join().expect("Writer thread panicked");
     }
 
+
     if args.rc_sensitivity {
         // for i in 0..num_partitions {
         //     let partition_id = format!("{:0width$b}", i, width = args.p);
@@ -712,6 +692,7 @@ fn main() -> std::io::Result<()> {
 
         });
     }
+
 
     let final_filename = format!("{}/final.zst", &args.output);
     concatenate_partitions(
