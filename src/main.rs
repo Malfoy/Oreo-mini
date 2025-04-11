@@ -430,11 +430,11 @@ where
     }
     let mut power: u64 = 1;
     for _ in 0..(k - 1) {
-        power = power.wrapping_mul(base);
+        power = power * base;
     }
     let mut hash: u64 = 0;
     for i in 0..k {
-        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
+        hash = hash * base + nt_to_val(bytes[i]);
     }
     {
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
@@ -443,8 +443,8 @@ where
     for i in k..bytes.len() {
         let old_val = nt_to_val(bytes[i - k]);
         let new_val = nt_to_val(bytes[i]);
-        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
-        hash = hash.wrapping_mul(base).wrapping_add(new_val);
+        hash = hash - old_val.wrapping_mul(power);
+        hash = hash * base + new_val;
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
         f(kmer_array,value  as usize);
     }
@@ -460,11 +460,11 @@ fn score_kmer_array(seq: &str, k: usize, kmer_array: &mut Vec<u64>) -> u64 {
     }
     let mut power: u64 = 1;
     for _ in 0..(k - 1) {
-        power = power.wrapping_mul(base);
+        power = power * base;
     }
     let mut hash: u64 = 0;
     for i in 0..k {
-        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
+        hash = hash * base + nt_to_val(bytes[i]);
     }
     {
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
@@ -473,8 +473,8 @@ fn score_kmer_array(seq: &str, k: usize, kmer_array: &mut Vec<u64>) -> u64 {
     for i in k..bytes.len() {
         let old_val = nt_to_val(bytes[i - k]);
         let new_val = nt_to_val(bytes[i]);
-        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
-        hash = hash.wrapping_mul(base).wrapping_add(new_val);
+        hash = hash - old_val.wrapping_mul(power);
+        hash = hash * base + new_val;
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
         score += kmer_array[value as usize];
     }
