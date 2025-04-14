@@ -1,5 +1,5 @@
 use clap::Parser;
-use ahash::AHashMap;
+// use ahash::AHashMap;
 use bio::io::{fasta, fastq};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -15,6 +15,7 @@ use std::io::{BufReader, BufWriter, BufRead, Read, Write};
 use std::time::Instant;
 
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 use nthash::*;
 
@@ -60,6 +61,9 @@ struct Args {
 
     #[arg(long, default_value = "1")]
     rc_compression_loop: i32,
+
+    #[arg(short, long, default_value = "0")]
+    thread: usize,
 }
 
 /// A record (FASTA or FASTQ)
@@ -82,15 +86,15 @@ fn open_input(path: &str) -> Box<dyn Read> {
 }
 
 /// Convert a nucleotide to a 2-bit value (A:0, C:1, G:2, T:3)
-fn nt_to_val(b: u8) -> u64 {
-    match b {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => 0,
-    }
-}
+// fn nt_to_val(b: u8) -> u64 {
+//     match b {
+//         b'A' | b'a' => 0,
+//         b'C' | b'c' => 1,
+//         b'G' | b'g' => 2,
+//         b'T' | b't' => 3,
+//         _ => 0,
+//     }
+// }
 
 /// 64-bit multipliers for rolling hash (different for first- and second-level).
 const BASE1: u64 = 0x9e3779b97f4a7c15;
@@ -103,34 +107,14 @@ const BASE2: u64 = 0xc2b2ae3d27d4eb4f;
 ///   3. Keep the min hashed value in each bucket.
 /// Then build the P-bit fingerprint from the LSBs of each bucket.
 fn compute_partition(seq: &str, p: usize, k: usize, base: u64) -> u64 {
-    let index_bits = (p as f64).log2().ceil() as usize; // bits used for bucket index
+    let seq_bytes = seq.as_bytes();
+    let index_bits = (p as f64).log2().ceil() as usize;
     let buckets_count = 1 << index_bits; // use an array of length p
     let mut buckets: Vec<Option<u64>> = vec![None; buckets_count];
-    let bytes = seq.as_bytes();
-    if bytes.len() < k {
-        return 0;
-    }
-    let mut power: u64 = 1;
-    for _ in 0..(k - 1) {
-        power = power.wrapping_mul(base);
-    }
-    let mut hash: u64 = 0;
-    for i in 0..k {
-        hash = hash.wrapping_mul(base).wrapping_add(nt_to_val(bytes[i]));
-    }
-    {
-        let idx = (hash >> (64 - index_bits)) as usize;
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        buckets[idx] = Some(match buckets[idx] {
-            Some(current) if value > current => current,
-            _ => value,
-        });
-    }
-    for i in k..bytes.len() {
-        let old_val = nt_to_val(bytes[i - k]);
-        let new_val = nt_to_val(bytes[i]);
-        hash = hash.wrapping_sub(old_val.wrapping_mul(power));
-        hash = hash.wrapping_mul(base).wrapping_add(new_val);
+
+    let iter = NtHashForwardIterator::new(seq_bytes, k).expect("NtHash problem");
+    for it in iter {
+        let hash = it.wrapping_mul(base);
         let idx = (hash >> (64 - index_bits)) as usize;
         let value = hash & ((1u64 << (64 - index_bits)) - 1);
         buckets[idx] = Some(match buckets[idx] {
@@ -145,7 +129,6 @@ fn compute_partition(seq: &str, p: usize, k: usize, base: u64) -> u64 {
     }
     fingerprint & ((1 << p) -1 )
 }
-
 
 fn compute_partition_canonique(seq: &str, p: usize, k: usize, base: u64) -> u64 {
     let seq_bytes = seq.as_bytes();
@@ -312,9 +295,9 @@ fn reverse_complement(dna: &str) -> String {
         })
         .collect()
 }
-fn update_kmer_dict<F>(seq: &str, k: usize, dict: &mut AHashMap<u64, u64>, f: &mut F)
+fn update_kmer_dict<F>(seq: &str, k: usize, dict: &mut Vec<u64>, f: &mut F)
 where
-    F: FnMut(&mut AHashMap<u64, u64>, u64),
+    F: FnMut(&mut Vec<u64>, usize),
 {
     let bytes = seq.as_bytes();
     if bytes.len() < k {
@@ -323,26 +306,9 @@ where
     // Create an iterator over k-mer hashes.
     let iter = NtHashForwardIterator::new(bytes, k).expect("NtHash error");
     for kmer in iter {
-        f(dict, kmer);
+        f(dict, kmer as usize);
     }
 }
-
-/// Compute the score of `seq` by summing the frequency counts for all its k-mers from `dict`,
-/// using NtHashForwardIterator to traverse the sequence efficiently.
-fn score_kmer_dict(seq: &str, k: usize, dict: &AHashMap<u64, u64>) -> u64 {
-    let bytes = seq.as_bytes();
-    if bytes.len() < k {
-        return 0;
-    }
-    let mut score = 0;
-    let iter = NtHashForwardIterator::new(bytes, k).expect("NtHash error");
-    for kmer in iter {
-        score += *dict.get(&kmer).unwrap_or(&0);
-    }
-    score
-}
-
-
 // --- The Updated update_rc_file Function ---
 
 /// Process the file once and perform the reverse-complement update internally in `rc_loops` passes.
@@ -358,15 +324,15 @@ fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
     // Read and convert all records from the input file into memory.
     let mut records: Vec<Record> = Vec::new();
     // Build the initial k-mer dictionary.
-    let mut kmer_dict: AHashMap<u64, u64> = AHashMap::new();
+    let size_array : usize = 1 << k;
+    let mut kmer_dict : Vec<u64> = vec![0; size_array];
+
     // Define update closures.
-    let mut incr = |dict: &mut AHashMap<u64, u64>, key: u64| {
-        *dict.entry(key).or_insert(0) += 1;
+    let mut incr = |dict: &mut Vec<u64>, key: usize| {
+        dict[key % (size_array as u64) as usize] += 1;
     };
-    let mut decr = |dict: &mut AHashMap<u64, u64>, key: u64| {
-        if let Some(count) = dict.get_mut(&key) {
-            *count = count.saturating_sub(1);
-        }
+    let mut decr = |dict: &mut Vec<u64>, key: usize| {
+        dict[key % (size_array as u64) as usize] -= 1;
     };
 
     if is_fastq {
@@ -407,8 +373,8 @@ fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
                     // Compute both scores in a single pass.
                     let (mut fwd_score, mut rev_score) = (0, 0);
                     for (fwd_kmer, rev_kmer) in fwd_iter.zip(rev_iter) {
-                        fwd_score += *kmer_dict.get(&fwd_kmer).unwrap_or(&0);
-                        rev_score += *kmer_dict.get(&rev_kmer).unwrap_or(&0);
+                        fwd_score += kmer_dict[(fwd_kmer % (size_array as u64)) as usize];
+                        rev_score += kmer_dict[(rev_kmer % (size_array as u64)) as usize];
                     }
                     // If the reverse complement yields a higher score, flip the record.
                     if fwd_score < rev_score {
@@ -430,8 +396,8 @@ fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
                         .expect("Error creating reverse k-mer iterator");
                     let (mut fwd_score, mut rev_score) = (0, 0);
                     for (fwd_kmer, rev_kmer) in fwd_iter.zip(rev_iter) {
-                        fwd_score += *kmer_dict.get(&fwd_kmer).unwrap_or(&0);
-                        rev_score += *kmer_dict.get(&rev_kmer).unwrap_or(&0);
+                        fwd_score += kmer_dict[(fwd_kmer % (size_array as u64)) as usize];
+                        rev_score += kmer_dict[(rev_kmer % (size_array as u64)) as usize];
                     }
                     if fwd_score < rev_score {
                         update_kmer_dict(seq, k, &mut kmer_dict, &mut decr);
@@ -694,12 +660,23 @@ fn main() -> std::io::Result<()> {
     }
 
 
-    if args.rc_sensitivity {
-        (0..num_partitions).into_par_iter().for_each(|i| {
-            let partition_id = format!("{:0width$b}", i, width = args.p);
-            let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-            update_rc_file(&filename, k,args.rc_compression_loop);
 
+    if args.rc_sensitivity {
+
+        println!("Sensitivity Activate");
+
+        let pool = ThreadPoolBuilder::new()
+        .num_threads(args.thread)
+        .build()
+        .unwrap();
+
+        pool.install(|| {
+            (0..num_partitions).into_par_iter().for_each(|i| {
+                let partition_id = format!("{:0width$b}", i, width = args.p);
+                let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+                let _ = update_rc_file(&filename, k,args.rc_compression_loop);
+
+            });
         });
     }
 
