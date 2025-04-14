@@ -1,4 +1,5 @@
 use clap::Parser;
+use ahash::AHashMap;
 use bio::io::{fasta, fastq};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -15,7 +16,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use nthash::NtHashIterator;
+use nthash::*;
 
 /// Command-line arguments.
 #[derive(Parser)]
@@ -311,175 +312,199 @@ fn reverse_complement(dna: &str) -> String {
         })
         .collect()
 }
-
-fn update_rc_file(input: &str, k: usize) {
-    let mut input_reader = open_input(input);
-    let mut buf_reader = BufReader::new(input_reader);
-
-    let peek = buf_reader.fill_buf().expect("Error peeking input");
-    let is_fastq = !peek.is_empty() && peek[0] == b'@';
-
-    let taille = 1 << 2*k;
-    let mut kmer_array: Vec<u64> = vec![0; taille];
-
-    let incr = |t: &mut Vec<u64>, s:usize| {
-        t[s] += 1
-    };
-
-    let decr = |t: &mut Vec<u64>, s:usize| {
-        t[s] -= 1
-    };
-
-    if is_fastq {
-        let reader = fastq::Reader::new(buf_reader);
-        for result in reader.records() {
-            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTQ reading");
-            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
-            update_kmer_array(&seq, k, &mut kmer_array, incr);
-        }
-    } else {
-        let reader = fasta::Reader::new(buf_reader);
-        for result in reader.records() {
-            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTA reading");
-            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
-            update_kmer_array(&seq, k, &mut kmer_array, incr);
-        }
-    }
-
-
-    input_reader = open_input(input);
-    buf_reader = BufReader::new(input_reader);
-    let input_temp = input.to_owned()+".temp";
-    let file = File::create(input_temp.clone())
-        .unwrap_or_else(|e| panic!("Cannot create {}: {}", input.to_owned()+".temp", e));
-    let encoder = Encoder::new(file, 4)
-        .expect("Cannot create zstd encoder for partition");
-    let mut writer = BufWriter::new(encoder);
-
-    if is_fastq {
-        let reader = fastq::Reader::new(buf_reader);
-        for result in reader.records() {
-            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTQ reading");
-            let id = record.id().to_owned();
-            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
-            let qual = std::str::from_utf8(record.qual()).unwrap_or("").to_owned();
-            let seqrc = reverse_complement(&seq);
-            let score = score_kmer_array(&seq, k, &mut kmer_array);
-            let score_rc = score_kmer_array(&seqrc, k, &mut kmer_array);
-            // println!("{} - {}",score,score_rc);
-            if score > score_rc {
-                writeln!(writer, "@{}", id).expect("Write error");
-                writeln!(writer, "{}", seq).expect("Write error");
-                writeln!(writer, "+").expect("Write error");
-                writeln!(writer, "{}", qual).expect("Write error");
-            } else {
-                writeln!(writer, "@{}", id).expect("Write error");
-                writeln!(writer, "{}", seqrc).expect("Write error");
-                writeln!(writer, "+").expect("Write error");
-                writeln!(writer, "{}", qual).expect("Write error");
-                // TODO reverse quality
-                update_kmer_array(&seq, k, &mut kmer_array, decr);
-                update_kmer_array(&seqrc, k, &mut kmer_array, incr);
-                // println!("Flip");
-            }
-        }
-    } else {
-        let reader = fasta::Reader::new(buf_reader);
-        for result in reader.records() {
-            let record = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).expect("Error FASTA reading");
-            let id = record.id().to_owned();
-            let seq = std::str::from_utf8(record.seq()).unwrap_or("").to_owned();
-            let seqrc = reverse_complement(&seq);
-            let score = score_kmer_array(&seq, k, &mut kmer_array);
-            let score_rc = score_kmer_array(&seqrc, k, &mut kmer_array);
-            if score > score_rc {
-                writeln!(writer, ">{}", id).expect("Write error");
-                writeln!(writer, "{}", seq).expect("Write error");
-            } else {
-                writeln!(writer, ">{}", id).expect("Write error");
-                writeln!(writer, "{}", seqrc).expect("Write error");
-                update_kmer_array(&seq, k, &mut kmer_array, decr);
-                update_kmer_array(&seqrc, k, &mut kmer_array, incr);
-                // print!(".");
-            }
-        }
-
-        writer.flush().expect("Flush error");
-        match writer.into_inner() {
-            Ok(encoder) => {
-                if let Err(e) = encoder.finish() {
-                    eprintln!("Error finishing partition zstd stream: {}", e);
-                }
-            }
-            Err(_) => eprintln!("Error retrieving inner encoder for partition"),
-        }
-        fs::rename(input_temp, input).expect("Error rename");
-    }
-
-}
-
-fn update_kmer_array<F>(seq: &str, k: usize, kmer_array: &mut Vec<u64>, mut f: F)
+fn update_kmer_dict<F>(seq: &str, k: usize, dict: &mut AHashMap<u64, u64>, f: &mut F)
 where
-    F: FnMut(&mut Vec<u64>, usize)
+    F: FnMut(&mut AHashMap<u64, u64>, u64),
 {
-    let base = 4;
-    let index_bits = k;
     let bytes = seq.as_bytes();
     if bytes.len() < k {
         return;
     }
-    let mut power: u64 = 1;
-    for _ in 0..(k - 1) {
-        power = power * base;
-    }
-    let mut hash: u64 = 0;
-    for i in 0..k {
-        hash = hash * base + nt_to_val(bytes[i]);
-    }
-    {
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        f(kmer_array,value as usize);
-    }
-    for i in k..bytes.len() {
-        let old_val = nt_to_val(bytes[i - k]);
-        let new_val = nt_to_val(bytes[i]);
-        hash = hash - old_val.wrapping_mul(power);
-        hash = hash * base + new_val;
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        f(kmer_array,value  as usize);
+    // Create an iterator over k-mer hashes.
+    let iter = NtHashForwardIterator::new(bytes, k).expect("NtHash error");
+    for kmer in iter {
+        f(dict, kmer);
     }
 }
 
-fn score_kmer_array(seq: &str, k: usize, kmer_array: &mut Vec<u64>) -> u64 {
-    let base = 4;
-    let index_bits = k;
+/// Compute the score of `seq` by summing the frequency counts for all its k-mers from `dict`,
+/// using NtHashForwardIterator to traverse the sequence efficiently.
+fn score_kmer_dict(seq: &str, k: usize, dict: &AHashMap<u64, u64>) -> u64 {
     let bytes = seq.as_bytes();
-    let mut score = 0;
     if bytes.len() < k {
         return 0;
     }
-    let mut power: u64 = 1;
-    for _ in 0..(k - 1) {
-        power = power * base;
-    }
-    let mut hash: u64 = 0;
-    for i in 0..k {
-        hash = hash * base + nt_to_val(bytes[i]);
-    }
-    {
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        score += kmer_array[value as usize];
-    }
-    for i in k..bytes.len() {
-        let old_val = nt_to_val(bytes[i - k]);
-        let new_val = nt_to_val(bytes[i]);
-        hash = hash - old_val.wrapping_mul(power);
-        hash = hash * base + new_val;
-        let value = hash & ((1u64 << (64 - index_bits)) - 1);
-        score += kmer_array[value as usize];
+    let mut score = 0;
+    let iter = NtHashForwardIterator::new(bytes, k).expect("NtHash error");
+    for kmer in iter {
+        score += *dict.get(&kmer).unwrap_or(&0);
     }
     score
 }
+
+
+// --- The Updated update_rc_file Function ---
+
+/// Process the file once and perform the reverse-complement update internally in `rc_loops` passes.
+/// For FASTQ, the quality string is reversed if the record is flipped.
+fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
+    let input_reader = open_input(input);
+    let mut buf_reader = BufReader::new(input_reader);
+
+    // Determine whether the input is FASTQ (first byte '@') or FASTA.
+    let peek = buf_reader.fill_buf()?;
+    let is_fastq = !peek.is_empty() && peek[0] == b'@';
+
+    // Read and convert all records from the input file into memory.
+    let mut records: Vec<Record> = Vec::new();
+    // Build the initial k-mer dictionary.
+    let mut kmer_dict: AHashMap<u64, u64> = AHashMap::new();
+    // Define update closures.
+    let mut incr = |dict: &mut AHashMap<u64, u64>, key: u64| {
+        *dict.entry(key).or_insert(0) += 1;
+    };
+    let mut decr = |dict: &mut AHashMap<u64, u64>, key: u64| {
+        if let Some(count) = dict.get_mut(&key) {
+            *count = count.saturating_sub(1);
+        }
+    };
+
+    if is_fastq {
+        let reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
+            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            // Convert the bio::io::fastq::Record to our custom Record.
+            let id = rec.id().to_owned();
+            let seq = String::from_utf8_lossy(rec.seq()).into_owned();
+            let qual = String::from_utf8_lossy(rec.qual()).into_owned();
+            // Update dictionary with forward sequence.
+            update_kmer_dict(&seq, k, &mut kmer_dict, &mut incr);
+            records.push(Record::Fastq { id, seq, qual });
+        }
+    } else {
+        let reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
+            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let id = rec.id().to_owned();
+            let seq = String::from_utf8_lossy(rec.seq()).into_owned();
+            update_kmer_dict(&seq, k, &mut kmer_dict, &mut incr);
+            records.push(Record::Fasta { id, seq });
+        }
+    }
+
+    // Now perform the reverse-complement update rc_loops times.
+    for _ in 0..rc_loops {
+        for record in records.iter_mut() {
+            match record {
+                Record::Fastq { ref mut seq, ref mut qual, .. } => {
+                    // Compute the reverse complement once.
+                    let rev_seq = reverse_complement(seq);
+                    // Create rolling hash iterators using nthash.
+                    let fwd_iter = NtHashForwardIterator::new(seq.as_bytes(), k)
+                        .expect("Error creating forward k-mer iterator");
+                    let rev_iter = NtHashForwardIterator::new(rev_seq.as_bytes(), k)
+                        .expect("Error creating reverse k-mer iterator");
+                    // Compute both scores in a single pass.
+                    let (mut fwd_score, mut rev_score) = (0, 0);
+                    for (fwd_kmer, rev_kmer) in fwd_iter.zip(rev_iter) {
+                        fwd_score += *kmer_dict.get(&fwd_kmer).unwrap_or(&0);
+                        rev_score += *kmer_dict.get(&rev_kmer).unwrap_or(&0);
+                    }
+                    // If the reverse complement yields a higher score, flip the record.
+                    if fwd_score < rev_score {
+                        // Remove the forward k-mer counts.
+                        update_kmer_dict(seq, k, &mut kmer_dict, &mut decr);
+                        // Update the sequence with its reverse complement.
+                        *seq = rev_seq;
+                        // For FASTQ, reverse the quality string.
+                        *qual = qual.chars().rev().collect();
+                        // Update the dictionary with the k-mer counts for the new orientation.
+                        update_kmer_dict(seq, k, &mut kmer_dict, &mut incr);
+                    }
+                }
+                Record::Fasta { ref mut seq, .. } => {
+                    let rev_seq = reverse_complement(seq);
+                    let fwd_iter = NtHashForwardIterator::new(seq.as_bytes(), k)
+                        .expect("Error creating forward k-mer iterator");
+                    let rev_iter = NtHashForwardIterator::new(rev_seq.as_bytes(), k)
+                        .expect("Error creating reverse k-mer iterator");
+                    let (mut fwd_score, mut rev_score) = (0, 0);
+                    for (fwd_kmer, rev_kmer) in fwd_iter.zip(rev_iter) {
+                        fwd_score += *kmer_dict.get(&fwd_kmer).unwrap_or(&0);
+                        rev_score += *kmer_dict.get(&rev_kmer).unwrap_or(&0);
+                    }
+                    if fwd_score < rev_score {
+                        update_kmer_dict(seq, k, &mut kmer_dict, &mut decr);
+                        *seq = rev_seq;
+                        update_kmer_dict(seq, k, &mut kmer_dict, &mut incr);
+                    }
+                }
+            }
+        }
+    }
+
+    // Write the final records out to a temporary file.
+    let temp_path = input.to_owned() + ".temp";
+    let file = File::create(&temp_path)
+        .unwrap_or_else(|e| panic!("Cannot create {}: {}", temp_path, e));
+    let encoder = Encoder::new(file, 4).expect("Cannot create zstd encoder for partition");
+    let mut writer = BufWriter::new(encoder);
+
+    if is_fastq {
+        for record in &records {
+            if let Record::Fastq { id, seq, qual } = record {
+                writeln!(writer, "@{}", id)?;
+                writeln!(writer, "{}", seq)?;
+                writeln!(writer, "+")?;
+                writeln!(writer, "{}", qual)?;
+            }
+        }
+    } else {
+        for record in &records {
+            if let Record::Fasta { id, seq } = record {
+                writeln!(writer, ">{}", id)?;
+                writeln!(writer, "{}", seq)?;
+            }
+        }
+    }
+    writer.flush()?;
+    let encoder = writer
+        .into_inner()
+        .unwrap_or_else(|_| panic!("Error retrieving inner encoder"));
+    if let Err(e) = encoder.finish() {
+        eprintln!("Error finishing zstd stream: {}", e);
+    }
+    // For FASTA files, rename the temporary file to overwrite the original.
+    if !is_fastq {
+        fs::rename(temp_path, input).expect("Error renaming temporary file");
+    }
+    Ok(())
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 fn main() -> std::io::Result<()> {
@@ -670,25 +695,10 @@ fn main() -> std::io::Result<()> {
 
 
     if args.rc_sensitivity {
-        // for i in 0..num_partitions {
-        //     let partition_id = format!("{:0width$b}", i, width = args.p);
-        //     let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-        //     println!("{}",filename);
-        //     for _ in 0..args.rc_compression_loop {
-        //         update_rc_file(&filename, k);
-        //     }
-        //
-        //     break;
-        // }
         (0..num_partitions).into_par_iter().for_each(|i| {
             let partition_id = format!("{:0width$b}", i, width = args.p);
             let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-            // println!("{}", filename);
-
-            for _ in 0..args.rc_compression_loop{
-                // println!("{}",x);
-                update_rc_file(&filename, k);
-            }
+            update_rc_file(&filename, k,args.rc_compression_loop);
 
         });
     }
