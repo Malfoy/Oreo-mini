@@ -8,7 +8,7 @@ use zstd::stream::{Encoder, Decoder};
 use zstd::stream::raw::CParameter;
 use crossbeam_channel;
 use num_cpus;
-use std::sync::{Arc};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{File, self};
 use std::io::{BufReader, BufWriter, BufRead, Read, Write};
@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+
 
 use nthash::*;
 
@@ -84,17 +85,6 @@ fn open_input(path: &str) -> Box<dyn Read> {
         Box::new(file)
     }
 }
-
-/// Convert a nucleotide to a 2-bit value (A:0, C:1, G:2, T:3)
-// fn nt_to_val(b: u8) -> u64 {
-//     match b {
-//         b'A' | b'a' => 0,
-//         b'C' | b'c' => 1,
-//         b'G' | b'g' => 2,
-//         b'T' | b't' => 3,
-//         _ => 0,
-//     }
-// }
 
 /// 64-bit multipliers for rolling hash (different for first- and second-level).
 const BASE1: u64 = 0x9e3779b97f4a7c15;
@@ -313,9 +303,11 @@ where
 
 /// Process the file once and perform the reverse-complement update internally in `rc_loops` passes.
 /// For FASTQ, the quality string is reversed if the record is flipped.
-fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
+fn update_rc_file(input: &str, args: &Args, k: usize) -> std::io::Result<()> {
     let input_reader = open_input(input);
+    let rc_loops = args.rc_compression_loop;
     let mut buf_reader = BufReader::new(input_reader);
+    let compression_level = args.compression_level;
 
     // Determine whether the input is FASTQ (first byte '@') or FASTA.
     let peek = buf_reader.fill_buf()?;
@@ -413,7 +405,7 @@ fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
     let temp_path = input.to_owned() + ".temp";
     let file = File::create(&temp_path)
         .unwrap_or_else(|e| panic!("Cannot create {}: {}", temp_path, e));
-    let encoder = Encoder::new(file, 4).expect("Cannot create zstd encoder for partition");
+    let encoder = Encoder::new(file, compression_level).expect("Cannot create zstd encoder for partition");
     let mut writer = BufWriter::new(encoder);
 
     if is_fastq {
@@ -430,6 +422,225 @@ fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
             if let Record::Fasta { id, seq } = record {
                 writeln!(writer, ">{}", id)?;
                 writeln!(writer, "{}", seq)?;
+            }
+        }
+    }
+    writer.flush()?;
+    let encoder = writer
+        .into_inner()
+        .unwrap_or_else(|_| panic!("Error retrieving inner encoder"));
+    if let Err(e) = encoder.finish() {
+        eprintln!("Error finishing zstd stream: {}", e);
+    }
+    // For FASTA files, rename the temporary file to overwrite the original.
+    if !is_fastq {
+        fs::rename(temp_path, input).expect("Error renaming temporary file");
+    }
+    Ok(())
+}
+
+
+
+fn create_bucket_files(args: &Args, k: usize, base: u64) -> std::io::Result<()> {
+    let input = open_input(&args.input.clone());
+    let mut buf_reader = BufReader::new(input);
+    let peek = buf_reader.fill_buf().expect("Error peeking input");
+    let is_fastq = !peek.is_empty() && peek[0] == b'@';
+    let compression_level = args.compression_level;
+    let p = args.p;
+    let thread = args.thread;
+    let rc_sensitivity = args.rc_sensitivity;
+    let outdir = args.output.clone();
+    let size_array = 1 << p;
+
+    let mut writers: Vec<Arc<Mutex<BufWriter<Encoder<File>>>>> = Vec::with_capacity(size_array);
+
+    for fp in 0..size_array {
+        let partition_id = format!("{:0width$b}", fp, width = p);
+        let filename = format!("{}/partition_{}.fa.zst", outdir, partition_id);
+        let file = File::create(&filename)
+            .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename, e));
+
+        let encoder = Encoder::new(file, compression_level)
+            .expect("Cannot create zstd encoder for partition");
+        let writer = BufWriter::new(encoder);
+        writers.push(Arc::new(Mutex::new(writer)));
+    }
+
+    let files = Arc::new(writers);
+
+    let (record_tx, record_rx) = crossbeam_channel::bounded::<Record>(100);
+    let num_workers = if thread > 0 {
+        std::cmp::min(thread, num_cpus::get())
+    } else {
+        num_cpus::get()
+    };
+    let worker_handles: Vec<_> = (0..num_workers)
+        .map(|_| {
+            let record_rx = record_rx.clone();
+            let p = p;
+            let k = k;
+            let files_clone = Arc::clone(&files);
+            let rc_sensitivity = rc_sensitivity;
+            std::thread::spawn(move || {
+                while let Ok(record) = record_rx.recv() {
+                    match record {
+                        Record::Fasta { id, seq } => {
+                            let fp = if rc_sensitivity {
+                                compute_partition_canonique(&seq, p, k, base)
+                            } else {
+                                compute_partition(&seq, p, k, base)
+                            };
+
+                            let writer_mutex = &files_clone[fp as usize];
+                            let mut writer = writer_mutex.lock().unwrap();
+                            writeln!(writer, ">{}", id).expect("Write error");
+                            writeln!(writer, "{}", seq).expect("Write error");
+                        }
+                        Record::Fastq { id, seq, qual } => {
+                            let fp = if rc_sensitivity {
+                                compute_partition_canonique(&seq, p, k, base)
+                            } else {
+                                compute_partition(&seq, p, k, base)
+                            };
+
+                            let writer_mutex = &files_clone[fp as usize];
+                            let mut writer = writer_mutex.lock().unwrap();
+                            writeln!(writer, "@{}", id).expect("Write error");
+                            writeln!(writer, "{}", seq).expect("Write error");
+                            writeln!(writer, "+").expect("Write error");
+                            writeln!(writer, "{}", qual).expect("Write error");
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+
+
+    if is_fastq {
+        let reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
+            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let id = rec.id().to_owned();
+            let seq = std::str::from_utf8(rec.seq()).unwrap_or("").to_owned();
+            let qual = std::str::from_utf8(rec.qual()).unwrap_or("").to_owned();
+            record_tx.send(Record::Fastq { id, seq, qual }).expect("Failed to send record");
+        }
+    } else {
+        let reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
+            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let id = rec.id().to_owned();
+            let seq = std::str::from_utf8(rec.seq()).unwrap_or("").to_owned();
+            record_tx.send(Record::Fasta { id, seq }).expect("Failed to send record");
+        }
+    }
+    drop(record_tx);
+
+    for handle in worker_handles {
+        handle.join().expect("Worker thread panicked");
+    }
+
+    for writer_mutex in &*files {
+        let mut writer_guard = writer_mutex.lock().unwrap();
+
+        let null_file = File::create("/dev/null").expect("Cannot open /dev/null");
+        let null_encoder = Encoder::new(null_file, 0).expect("Failed to create dummy encoder");
+
+        let mut writer = std::mem::replace(&mut *writer_guard, BufWriter::new(null_encoder));
+
+        if let Err(e) = writer.flush() {
+            eprintln!("Flush error: {}", e);
+        }
+
+        match writer.into_inner() {
+            Ok(encoder) => {
+                if let Err(e) = encoder.finish() {
+                    eprintln!("Error finishing encoder: {}", e);
+                }
+            }
+            Err(_) => {
+                eprintln!("Error retrieving inner encoder");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn update_level(filename:&str, args: &Args, k: usize, base: u64) -> std::io::Result<()> {
+    let input = filename;
+    let compression_level = args.compression_level;
+    let p = args.p;
+    let rc_sensitivity = args.rc_sensitivity;
+    let input_reader = open_input(input);
+    let mut buf_reader = BufReader::new(input_reader);
+
+    // Determine whether the input is FASTQ (first byte '@') or FASTA.
+    let peek = buf_reader.fill_buf()?;
+    let is_fastq = !peek.is_empty() && peek[0] == b'@';
+
+    // Read and convert all records from the input file into memory.
+    let mut records: Vec<Record> = Vec::new();
+
+    if is_fastq {
+        let reader = fastq::Reader::new(buf_reader);
+        for result in reader.records() {
+            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let id = rec.id().to_owned();
+            let seq = String::from_utf8_lossy(rec.seq()).into_owned();
+            let qual = String::from_utf8_lossy(rec.qual()).into_owned();
+            records.push(Record::Fastq { id, seq, qual });
+        }
+    } else {
+        let reader = fasta::Reader::new(buf_reader);
+        for result in reader.records() {
+            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let id = rec.id().to_owned();
+            let seq = String::from_utf8_lossy(rec.seq()).into_owned();
+            records.push(Record::Fasta { id, seq });
+        }
+    }
+
+
+
+
+    let mut subpartitions: Vec<Vec<Record>> = (0..(1 << p)).map(|_| Vec::new()).collect();
+    for record in records {
+        let (seq, _) = match &record {
+            Record::Fasta { seq, .. } => (seq, false),
+            Record::Fastq { seq, .. } => (seq, true),
+        };
+        let fp2;
+        if rc_sensitivity {
+            fp2 = compute_partition_canonique(seq, p, k, base) as usize;
+        } else {
+            fp2 = compute_partition(seq, p, k, base) as usize;
+        }
+        subpartitions[fp2].push(record);
+    }
+    let temp_path = input.to_owned() + ".temp";
+    let file = File::create(&temp_path)
+        .unwrap_or_else(|e| panic!("Cannot create {}: {}", temp_path, e));
+    let encoder = Encoder::new(file, compression_level)
+        .expect("Cannot create zstd encoder for partition");
+    let mut writer = BufWriter::new(encoder);
+    let gray_order2 = generate_gray_code_order(p);
+    for idx in gray_order2 {
+        for rec in &subpartitions[idx] {
+            match rec {
+                Record::Fasta { id, seq } => {
+                    writeln!(writer, ">{}", id).expect("Write error");
+                    writeln!(writer, "{}", seq).expect("Write error");
+                }
+                Record::Fastq { id, seq, qual } => {
+                    writeln!(writer, "@{}", id).expect("Write error");
+                    writeln!(writer, "{}", seq).expect("Write error");
+                    writeln!(writer, "+").expect("Write error");
+                    writeln!(writer, "{}", qual).expect("Write error");
+                }
             }
         }
     }
@@ -466,13 +677,6 @@ fn update_rc_file(input: &str, k: usize, rc_loops: i32) -> std::io::Result<()> {
 
 
 
-
-
-
-
-
-
-
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let start = Instant::now();
@@ -487,179 +691,39 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+
+
+    let _ = create_bucket_files(&args, k, BASE1);
+
+
+    //
+    //
     let nucleotide_count = Arc::new(AtomicU64::new(0));
     let num_partitions = 1 << args.p;
 
-    let mut partition_senders = Vec::with_capacity(num_partitions);
-    let mut partition_receivers = Vec::with_capacity(num_partitions);
-    for _ in 0..num_partitions {
-        let (tx, rx) = crossbeam_channel::bounded::<Record>(100);
-        partition_senders.push(tx);
-        partition_receivers.push(rx);
-    }
 
     let out_dir = args.output.clone();
-    let mut writer_handles = Vec::with_capacity(num_partitions);
-    for i in 0..num_partitions {
-        let partition_id = format!("{:0width$b}", i, width = args.p);
-        let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-        let rx = partition_receivers.remove(0);
-        let compression_level = args.compression_level;
-        let p = args.p;
-        let k = k;
-        let second_level = args.second_level;
-        let handle = std::thread::spawn(move || {
-            let mut partition_records = Vec::new();
-            while let Ok(record) = rx.recv() {
-                partition_records.push(record);
-            }
-            if second_level {
-                let mut subpartitions: Vec<Vec<Record>> = (0..(1 << p)).map(|_| Vec::new()).collect();
-                for record in partition_records {
-                    let (seq, _) = match &record {
-                        Record::Fasta { seq, .. } => (seq, false),
-                        Record::Fastq { seq, .. } => (seq, true),
-                    };
-                    let fp2;
-                    if args.rc_sensitivity {
-                        fp2 = compute_partition_canonique(seq, p, k, BASE2) as usize;
-                    } else {
-                        fp2 = compute_partition(seq, p, k, BASE2) as usize;
-                    }
-                    subpartitions[fp2].push(record);
-                }
-                let file = File::create(&filename)
-                    .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename, e));
-                let encoder = Encoder::new(file, compression_level)
-                    .expect("Cannot create zstd encoder for partition");
-                let mut writer = BufWriter::new(encoder);
-                let gray_order2 = generate_gray_code_order(p);
-                for idx in gray_order2 {
-                    for rec in &subpartitions[idx] {
-                        match rec {
-                            Record::Fasta { id, seq } => {
-                                writeln!(writer, ">{}", id).expect("Write error");
-                                writeln!(writer, "{}", seq).expect("Write error");
-                            }
-                            Record::Fastq { id, seq, qual } => {
-                                writeln!(writer, "@{}", id).expect("Write error");
-                                writeln!(writer, "{}", seq).expect("Write error");
-                                writeln!(writer, "+").expect("Write error");
-                                writeln!(writer, "{}", qual).expect("Write error");
-                            }
-                        }
-                    }
-                }
-                writer.flush().expect("Flush error");
-                match writer.into_inner() {
-                    Ok(encoder) => {
-                        if let Err(e) = encoder.finish() {
-                            eprintln!("Error finishing partition zstd stream: {}", e);
-                        }
-                    }
-                    Err(_) => eprintln!("Error retrieving inner encoder for partition"),
-                }
-            } else {
-                let file = File::create(&filename)
-                    .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename, e));
-                let encoder = Encoder::new(file, compression_level)
-                    .expect("Cannot create zstd encoder for partition");
-                let mut writer = BufWriter::new(encoder);
-                for rec in partition_records {
-                    match rec {
-                        Record::Fasta { id, seq } => {
-                            writeln!(writer, ">{}", id).expect("Write error");
-                            writeln!(writer, "{}", seq).expect("Write error");
-                        }
-                        Record::Fastq { id, seq, qual } => {
-                            writeln!(writer, "@{}", id).expect("Write error");
-                            writeln!(writer, "{}", seq).expect("Write error");
-                            writeln!(writer, "+").expect("Write error");
-                            writeln!(writer, "{}", qual).expect("Write error");
-                        }
-                    }
-                }
-                writer.flush().expect("Flush error");
-                match writer.into_inner() {
-                    Ok(encoder) => {
-                        if let Err(e) = encoder.finish() {
-                            eprintln!("Error finishing partition zstd stream: {}", e);
-                        }
-                    }
-                    Err(_) => eprintln!("Error retrieving inner encoder for partition"),
-                }
-            }
+
+
+
+    if args.second_level {
+
+        println!("Second Level Activate");
+
+        let pool = ThreadPoolBuilder::new()
+        .num_threads(args.thread)
+        .build()
+        .unwrap();
+
+        pool.install(|| {
+            (0..num_partitions).into_par_iter().for_each(|i| {
+                let partition_id = format!("{:0width$b}", i, width = args.p);
+                let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+                let _ = update_level(&filename, &args, k, BASE2);
+
+            });
         });
-        writer_handles.push(handle);
     }
-
-    let (record_tx, record_rx) = crossbeam_channel::bounded::<Record>(100);
-    let partition_senders = Arc::new(partition_senders);
-    let num_workers = num_cpus::get();
-    let worker_handles: Vec<_> = (0..num_workers)
-        .map(|_| {
-            let record_rx = record_rx.clone();
-            let partition_senders = Arc::clone(&partition_senders);
-            let p = args.p;
-            let k = k;
-            let nucleotide_count = Arc::clone(&nucleotide_count);
-            std::thread::spawn(move || {
-                while let Ok(record) = record_rx.recv() {
-                    let seq = match &record {
-                        Record::Fasta { seq, .. } => seq,
-                        Record::Fastq { seq, .. } => seq,
-                    };
-                    nucleotide_count.fetch_add(seq.len() as u64, Ordering::Relaxed);
-                    // let fp = compute_partition(seq, p, k, BASE1);
-                    let fp;
-                    if args.rc_sensitivity {
-                        fp = compute_partition_canonique(seq, p, k, BASE1);
-                    } else {
-                        fp = compute_partition(seq, p, k, BASE1);
-                    }
-                    partition_senders[fp as usize]
-                        .send(record)
-                        .expect("Failed to send record to partition");
-                }
-            })
-        })
-        .collect();
-
-    let input = open_input(&args.input);
-    let mut buf_reader = BufReader::new(input);
-    let peek = buf_reader.fill_buf().expect("Error peeking input");
-    let is_fastq = !peek.is_empty() && peek[0] == b'@';
-
-    if is_fastq {
-        let reader = fastq::Reader::new(buf_reader);
-        for result in reader.records() {
-            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            let id = rec.id().to_owned();
-            let seq = std::str::from_utf8(rec.seq()).unwrap_or("").to_owned();
-            let qual = std::str::from_utf8(rec.qual()).unwrap_or("").to_owned();
-            record_tx.send(Record::Fastq { id, seq, qual }).expect("Failed to send record");
-        }
-    } else {
-        let reader = fasta::Reader::new(buf_reader);
-        for result in reader.records() {
-            let rec = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            let id = rec.id().to_owned();
-            let seq = std::str::from_utf8(rec.seq()).unwrap_or("").to_owned();
-            record_tx.send(Record::Fasta { id, seq }).expect("Failed to send record");
-        }
-    }
-    drop(record_tx);
-
-    for handle in worker_handles {
-        handle.join().expect("Worker thread panicked");
-    }
-    drop(partition_senders);
-
-    for handle in writer_handles {
-        handle.join().expect("Writer thread panicked");
-    }
-
-
 
     if args.rc_sensitivity {
 
@@ -674,12 +738,14 @@ fn main() -> std::io::Result<()> {
             (0..num_partitions).into_par_iter().for_each(|i| {
                 let partition_id = format!("{:0width$b}", i, width = args.p);
                 let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-                let _ = update_rc_file(&filename, k,args.rc_compression_loop);
+                let _ = update_rc_file(&filename, &args, k);
 
             });
         });
     }
 
+
+    println!("Final Compression");
 
     let final_filename = format!("{}/final.zst", &args.output);
     concatenate_partitions(
