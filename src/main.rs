@@ -17,6 +17,10 @@ use std::time::Instant;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
+use std::path::{Path};
+
+use indicatif::{ProgressBar, ProgressStyle};
+
 
 use nthash::*;
 
@@ -33,8 +37,8 @@ struct Args {
 
     /// Fingerprint bit-length P. The algorithm uses an array of length P and produces a P-bit fingerprint.
     /// This results in 2^P partition files. (Default: 8)
-    #[arg(short, long, default_value = "8")]
-    p: usize,
+    #[arg(short, long, value_delimiter = ',', use_value_delimiter = true, default_value = "8")]
+    p: Vec<usize>,
 
     /// k-mer length. If not provided, k is automatically chosen based on the first 1000 sequences.
     #[arg(short, long)]
@@ -52,9 +56,9 @@ struct Args {
     #[arg(long, default_value = "19")]
     final_compression_level: i32,
 
-    /// Enable second-level partitioning + reordering (using a different hash function, same p/k).
-    #[arg(long)]
-    second_level: bool,
+    // /// Enable second-level partitioning + reordering (using a different hash function, same p/k).
+    // #[arg(long)]
+    // second_level: bool,
 
     /// Enable reverse complement sensitivity
     #[arg(long)]
@@ -89,6 +93,19 @@ fn open_input(path: &str) -> Box<dyn Read> {
 /// 64-bit multipliers for rolling hash (different for first- and second-level).
 const BASE1: u64 = 0x9e3779b97f4a7c15;
 const BASE2: u64 = 0xc2b2ae3d27d4eb4f;
+
+
+const BASES: [u64; 9] = [
+    0x9e3779b97f4a7c15, // golden ratio
+    0xc2b2ae3d27d4eb4f, // murmur3 constant
+    0x165667b19e3779f9, // splitmix64 constant
+    0x27d4eb2f165667c5, // reversed Murmur3 + variation
+    0xa0761d6478bd642f, // wyhash constant
+    0xe7037ed1a0b428db, // wyhash v4 constant
+    0xbf58476d1ce4e5b9, // splitmix64 constant
+    0x94d049bb133111eb, // splitmix64 constant
+    0x2545f4914f6cdd1d, // LCG constant from PCG
+];
 
 /// Computes the partition fingerprint for a sequence using the given BASE multiplier.
 /// We maintain an array of length P. For each k-mer:
@@ -441,13 +458,13 @@ fn update_rc_file(input: &str, args: &Args, k: usize) -> std::io::Result<()> {
 
 
 
-fn create_bucket_files(args: &Args, k: usize, base: u64) -> std::io::Result<()> {
-    let input = open_input(&args.input.clone());
+fn create_bucket_files(filename_input:&str, filename_comp:&str, args: &Args, p: usize, k: usize, base: u64) -> std::io::Result<()> {
+    let input = open_input(filename_input);
     let mut buf_reader = BufReader::new(input);
     let peek = buf_reader.fill_buf().expect("Error peeking input");
     let is_fastq = !peek.is_empty() && peek[0] == b'@';
     let compression_level = args.compression_level;
-    let p = args.p;
+    // let p = args.p[0];
     let thread = args.thread;
     let rc_sensitivity = args.rc_sensitivity;
     let outdir = args.output.clone();
@@ -456,10 +473,9 @@ fn create_bucket_files(args: &Args, k: usize, base: u64) -> std::io::Result<()> 
     let mut writers: Vec<Arc<Mutex<BufWriter<Encoder<File>>>>> = Vec::with_capacity(size_array);
 
     for fp in 0..size_array {
-        let partition_id = format!("{:0width$b}", fp, width = p);
-        let filename = format!("{}/partition_{}.fa.zst", outdir, partition_id);
-        let file = File::create(&filename)
-            .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename, e));
+        let filename_partition = get_filename_partition(filename_comp,fp,p);
+        let file = File::create(&filename_partition)
+            .unwrap_or_else(|e| panic!("Cannot create {}: {}", filename_partition, e));
 
         let encoder = Encoder::new(file, compression_level)
             .expect("Cannot create zstd encoder for partition");
@@ -573,7 +589,7 @@ fn create_bucket_files(args: &Args, k: usize, base: u64) -> std::io::Result<()> 
 fn update_level(filename:&str, args: &Args, k: usize, base: u64) -> std::io::Result<()> {
     let input = filename;
     let compression_level = args.compression_level;
-    let p = args.p;
+    let p = args.p[0];
     let rc_sensitivity = args.rc_sensitivity;
     let input_reader = open_input(input);
     let mut buf_reader = BufReader::new(input_reader);
@@ -663,8 +679,139 @@ fn update_level(filename:&str, args: &Args, k: usize, base: u64) -> std::io::Res
 
 
 
+fn concat_bucket_files(filename:&str, args: &Args, p: usize, comp_level: i32) -> std::io::Result<()> {
+    let gray_order = generate_gray_code_order(p);
+    let final_file = File::create(filename)?;
+    let mut encoder = Encoder::new(final_file, comp_level)
+        .expect("Cannot create final zstd encoder");
+    encoder
+        .set_parameter(CParameter::NbWorkers(num_cpus::get() as u32))
+        .expect("Failed to set number of threads");
+    let mut final_writer = BufWriter::new(encoder);
+    for partition in gray_order {
+        let part_filename = get_filename_partition(filename,partition,p);
+        if let Ok(file) = File::open(&part_filename) {
+            let mut decoder = Decoder::new(file).expect("Cannot create zstd decoder for partition");
+            let mut buffer = [0u8; 8192];
+            loop {
+                let n = decoder.read(&mut buffer)?;
+                if n == 0 { break; }
+                final_writer.write_all(&buffer[..n])?;
+            }
+        }
+    }
+    final_writer.flush()?;
+    match final_writer.into_inner() {
+        Ok(encoder) => {
+            if let Err(e) = encoder.finish() {
+                eprintln!("Error finishing final zstd stream: {}", e);
+            }
+        }
+        Err(_) => eprintln!("Error retrieving inner final zstd encoder"),
+    }
+    Ok(())
+}
 
 
+fn get_filename_partition(filename: &str, partition: usize, p: usize) -> String {
+    let path = Path::new(filename);
+
+    // On récupère le parent (le dossier)
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+
+    // On récupère le nom du fichier (ex: monfichier.fa.zst)
+    let file_name = path.file_name().unwrap().to_string_lossy();
+
+    // On cherche les extensions
+    let parts: Vec<&str> = file_name.split('.').collect();
+
+    let partition_id = format!("{:0width$b}", partition, width = p);
+
+    if parts.len() > 1 {
+        // On garde toutes les extensions
+        let extensions = &parts[1..];
+        // Le nom de base (sans extensions)
+        let base = parts[0];
+
+        // Ajoute le suffixe
+        let new_base = format!("{}_{}", base, partition_id);
+        let new_file_name = format!("{}.{}", new_base, extensions.join("."));
+
+        parent.join(new_file_name).to_string_lossy().into_owned()
+    } else {
+        // Pas d'extension, on ajoute juste le suffixe
+        let new_base = format!("{}_{}", file_name, partition_id);
+        parent.join(new_base).to_string_lossy().into_owned()
+    }
+}
+
+
+fn compute_all_file(filename_input:&str, filename:&str, args: &Args, k: usize, level: usize) -> std::io::Result<()> {
+    let p = args.p[level];
+    let _ = create_bucket_files(filename_input, filename, &args, p, k, BASES[level]);
+    if level > 0 {
+        if let Err(e) = fs::remove_file(filename) {
+            eprintln!("Warning: could not remove {}: {}", filename, e);
+        }
+    }
+
+
+
+    if level + 1 < args.p.len()  {
+        let bar = ProgressBar::new(1 << p);
+        bar.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"));
+        for i in 0..(1 << p) {
+            let filename_partition = get_filename_partition(filename,i,p);
+            let _ = compute_all_file(&filename_partition, &filename_partition, args, k, level+1);
+            bar.inc(1);
+        }
+        // let pool = ThreadPoolBuilder::new()
+        //     .num_threads(args.thread)
+        //     .build()
+        //     .unwrap();
+        //
+        // pool.install(|| {
+        //     ( 0..(1 << p)).into_par_iter().for_each(|i| {
+        //         let filename_partition = get_filename_partition(filename,i,p);
+        //         let _ = compute_all_file(&filename_partition, &filename_partition, args, k, level+1);
+        //         bar.inc(1);
+        //
+        //     });
+        // });
+        bar.finish_with_message(format!("{} : Terminé !", filename));
+    } else {
+        if args.rc_sensitivity {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(args.thread)
+                .build()
+                .unwrap();
+
+            pool.install(|| {
+                ( 0..(1 << p)).into_par_iter().for_each(|i| {
+                    let filename_partition = get_filename_partition(filename,i,p);
+                    let _ = update_rc_file(&filename_partition, args, k);
+
+                });
+            });
+        }
+    }
+    if level == 0 {
+        let _ = concat_bucket_files(filename, &args, p, args.final_compression_level);
+    } else {
+        let _ = concat_bucket_files(filename, &args, p, args.compression_level);
+    }
+    for i in 0..(1 << p) {
+        let filename_partition = get_filename_partition(filename,i,p);
+        if let Err(e) = fs::remove_file(filename_partition) {
+            eprintln!("Warning: could not remove {}: {}", filename, e);
+        }
+    }
+
+    Ok(())
+}
 
 
 
@@ -691,72 +838,77 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+    println!("{:?}",args.p);
+
+    let final_filename = format!("{}/final.zst", args.output);
+    let _ = compute_all_file(&args.input.clone(), &final_filename, &args, k, 0);
 
 
-    let _ = create_bucket_files(&args, k, BASE1);
 
-
+    // let _ = create_bucket_files(&args, k, BASE1);
     //
     //
+    // //
+    // //
     let nucleotide_count = Arc::new(AtomicU64::new(0));
-    let num_partitions = 1 << args.p;
+    // let num_partitions = 1 << args.p[0];
+    //
+    //
+    // let out_dir = args.output.clone();
+    //
+    //
+    //
+    // if args.second_level {
+    //
+    //     println!("Second Level Activate");
+    //
+    //     let pool = ThreadPoolBuilder::new()
+    //     .num_threads(args.thread)
+    //     .build()
+    //     .unwrap();
+    //
+    //     pool.install(|| {
+    //         (0..num_partitions).into_par_iter().for_each(|i| {
+    //             let partition_id = format!("{:0width$b}", i, width = args.p[0]);
+    //             let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+    //             let _ = update_level(&filename, &args, k, BASE2);
+    //
+    //         });
+    //     });
+    // }
+    //
+    // if args.rc_sensitivity {
+    //
+    //     println!("Sensitivity Activate");
+    //
+    //     let pool = ThreadPoolBuilder::new()
+    //     .num_threads(args.thread)
+    //     .build()
+    //     .unwrap();
+    //
+    //     pool.install(|| {
+    //         (0..num_partitions).into_par_iter().for_each(|i| {
+    //             let partition_id = format!("{:0width$b}", i, width = args.p[0]);
+    //             let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
+    //             let _ = update_rc_file(&filename, &args, k);
+    //
+    //         });
+    //     });
+    // }
+    //
+    //
+    // println!("Final Compression");
+    //
+    // let final_filename = format!("{}/final.zst", &args.output);
+    // concatenate_partitions(
+    //     &args.output,
+    //     args.p[0],
+    //     &final_filename,
+    //     &args.final_compression,
+    //     args.final_compression_level,
+    // )?;
 
-
-    let out_dir = args.output.clone();
-
-
-
-    if args.second_level {
-
-        println!("Second Level Activate");
-
-        let pool = ThreadPoolBuilder::new()
-        .num_threads(args.thread)
-        .build()
-        .unwrap();
-
-        pool.install(|| {
-            (0..num_partitions).into_par_iter().for_each(|i| {
-                let partition_id = format!("{:0width$b}", i, width = args.p);
-                let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-                let _ = update_level(&filename, &args, k, BASE2);
-
-            });
-        });
-    }
-
-    if args.rc_sensitivity {
-
-        println!("Sensitivity Activate");
-
-        let pool = ThreadPoolBuilder::new()
-        .num_threads(args.thread)
-        .build()
-        .unwrap();
-
-        pool.install(|| {
-            (0..num_partitions).into_par_iter().for_each(|i| {
-                let partition_id = format!("{:0width$b}", i, width = args.p);
-                let filename = format!("{}/partition_{}.fa.zst", out_dir, partition_id);
-                let _ = update_rc_file(&filename, &args, k);
-
-            });
-        });
-    }
-
-
-    println!("Final Compression");
-
-    let final_filename = format!("{}/final.zst", &args.output);
-    concatenate_partitions(
-        &args.output,
-        args.p,
-        &final_filename,
-        &args.final_compression,
-        args.final_compression_level,
-    )?;
-
-    remove_partition_files(&args.output, args.p);
+    // remove_partition_files(&args.output, args.p[0]);
 
     let total_nucleotides = nucleotide_count.load(Ordering::Relaxed);
     let final_meta = fs::metadata(&final_filename)?;
