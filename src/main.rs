@@ -15,7 +15,7 @@ use std::io::{BufReader, BufWriter, BufRead, Read, Write};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
+use rayon::{ThreadPoolBuilder, ThreadPool};
 
 use std::path::{Path};
 
@@ -746,7 +746,8 @@ fn get_filename_partition(filename: &str, partition: usize, p: usize) -> String 
 }
 
 
-fn compute_all_file(filename_input:&str, filename:&str, args: &Args, k: usize, level: usize, multi: &MultiProgress, bars: &mut Vec<Option<ProgressBar>>) -> std::io::Result<()> {
+// fn compute_all_file(filename_input:&str, filename:&str, args: &Args, k: usize, level: usize, multi: &MultiProgress, bars: &mut Vec<Option<ProgressBar>>, pool: &ThreadPool) -> std::io::Result<()> {
+fn compute_all_file(filename_input:&str, filename:&str, args: &Args, k: usize, level: usize, pool: &ThreadPool) -> std::io::Result<()> {
     let p = args.p[level];
     let _ = create_bucket_files(filename_input, filename, &args, p, k, BASES[level]);
     if level > 0 {
@@ -758,47 +759,41 @@ fn compute_all_file(filename_input:&str, filename:&str, args: &Args, k: usize, l
 
 
     if level + 1 < args.p.len()  {
-        if bars[level].is_none() {
-            let bar = multi.add(ProgressBar::new(1 << p));
-            bar.set_prefix(format!("Niveau {}", level));
-            bar.set_style(
-                ProgressStyle::default_bar()
-                    .template("{prefix} [{bar:40.cyan/blue}] {pos}/{len} {elapsed} ETA: {eta}")
-                    .unwrap()
-                    .progress_chars("##-"),
-            );
-            bars[level] = Some(bar);
-        }
-        let bar = bars[level].as_ref().unwrap().clone();
-        bar.set_position(0);
-        for i in 0..(1 << p) {
-            let filename_partition = get_filename_partition(filename,i,p);
-            let _ = compute_all_file(&filename_partition, &filename_partition, args, k, level+1, multi, bars);
-            bar.inc(1);
-        }
+        // if bars[level].is_none() {
+        //     let bar = multi.add(ProgressBar::new(1 << p));
+        //     bar.set_prefix(format!("Niveau {}", level));
+        //     bar.set_style(
+        //         ProgressStyle::default_bar()
+        //             .template("{prefix} [{bar:40.cyan/blue}] {pos}/{len} {elapsed} ETA: {eta}")
+        //             .unwrap()
+        //             .progress_chars("##-"),
+        //     );
+        //     bars[level] = Some(bar);
+        // }
+        // let bar = bars[level].as_ref().unwrap().clone();
+        // bar.set_position(0);
+        // for i in 0..(1 << p) {
+        //     let filename_partition = get_filename_partition(filename,i,p);
+        //     let _ = compute_all_file(&filename_partition, &filename_partition, args, k, level+1, multi, bars, pool);
+        //     bar.inc(1);
+        // }
         // let pool = ThreadPoolBuilder::new()
         //     .num_threads(args.thread)
         //     .build()
         //     .unwrap();
         //
-        // pool.install(|| {
-        //     ( 0..(1 << p)).into_par_iter().for_each(|i| {
-        //         let filename_partition = get_filename_partition(filename,i,p);
-        //         let _ = compute_all_file(&filename_partition, &filename_partition, args, k, level+1);
-        //         bar.inc(1);
-        //
-        //     });
-        // });
-        if level == 0 {
-            bars[level].as_ref().unwrap().finish_with_message("Racine : terminé !");
-        }
+        pool.install(|| {
+            ( 0..(1 << p)).into_par_iter().for_each(|i| {
+                let filename_partition = get_filename_partition(filename,i,p);
+                let _ = compute_all_file(&filename_partition, &filename_partition, args, k, level+1, pool);
+                // bar.inc(1);
+            });
+        });
+        // if level == 0 {
+        //     bars[level].as_ref().unwrap().finish_with_message("Racine : terminé !");
+        // }
     } else {
         if args.rc_sensitivity {
-            let pool = ThreadPoolBuilder::new()
-                .num_threads(args.thread)
-                .build()
-                .unwrap();
-
             pool.install(|| {
                 ( 0..(1 << p)).into_par_iter().for_each(|i| {
                     let filename_partition = get_filename_partition(filename,i,p);
@@ -851,12 +846,18 @@ fn main() -> std::io::Result<()> {
     println!("{:?}",args.p);
 
 
-    let multi = MultiProgress::new();
-    let mut bars = vec![None; args.p.len()];
+    // let multi = MultiProgress::new();
+    // let mut bars = vec![None; args.p.len()];
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(args.thread)
+        .build()
+        .unwrap();
 
 
     let final_filename = format!("{}/final.zst", args.output);
-    let _ = compute_all_file(&args.input.clone(), &final_filename, &args, k, 0, &multi, &mut bars);
+    // let _ = compute_all_file(&args.input.clone(), &final_filename, &args, k, 0, &multi, &mut bars, &pool);
+    let _ = compute_all_file(&args.input.clone(), &final_filename, &args, k, 0, &pool);
 
 
 
