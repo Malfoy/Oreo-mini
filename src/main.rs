@@ -19,6 +19,7 @@ use nthash::*;
 use ahash::AHashMap;
 
 
+
 /// Command-line arguments.
 #[derive(Parser, Debug, Clone)]
 struct Args {
@@ -38,11 +39,6 @@ struct Args {
     /// k-mer length.
     #[arg(short, long, default_value = "21")]
     k: usize,
-
-    // --- REMOVED: compression_level is no longer needed for intermediate files ---
-    // #[arg(long, default_value = "-4")]
-    // compression_level: i32,
-    // --- END REMOVED ---
 
     /// Final compression algorithm ("zstd" or "gzip"). (Default: "zstd")
     #[arg(long, default_value = "zstd")]
@@ -64,19 +60,16 @@ struct Args {
     #[arg(short, long, default_value = "0")]
     thread: usize,
 
-    // --- Optional Counting Filter ---
     /// Enable the counting filter strategy. If disabled, all subsampled k-mers are used for fingerprinting.
     #[arg(long, default_value_t = true)]
     use_counting_filter: bool,
 
-    // --- Counting Filter Arguments (only used if --use-counting-filter is set) ---
     /// Total number of 2-bit counters (approximate size in bits = filter_counters * 2). Affects memory usage per shard.
     #[arg(long, default_value = "10000000000")]
     filter_counters: u64,
 
-    // --- Subsampling Argument ---
     /// Number of trailing zeros required in k-mer hash for subsampling (0=no subsampling, 1=1/2, 2=1/4, etc.).
-    #[arg(long, default_value = "3")] // Default to 1 (hash ends in 0)
+    #[arg(long, default_value = "8")] // Default to 1 (hash ends in 0)
     trailing_zeros: u32,
 }
 
@@ -116,9 +109,17 @@ fn homopolymer_compress(seq: &str) -> String {
 // --- Simple Hash Function ---
 #[inline]
 fn simple_mix_hash(mut n: u64) -> u64 {
-    const K: u64 = 0x517cc1b727220a95;
-    n = n.wrapping_mul(K);
-    n ^= n >> 32;
+ // Common xorshift* shift parameters for 64 bits often differ slightly,
+    // but we can use the standard ones followed by multiplication.
+    // Parameters from literature might be [12, 25, 27] or others.
+    // Using [13, 7, 17] for consistency with the previous example:
+    n ^= n >> 13;
+    n ^= n << 7;
+    n ^= n >> 17;
+
+    // Final multiplication step (using a common multiplier for xorshift*)
+    const K_STAR: u64 = 0x2545F4914F6CDD1D; // A common constant for xorshift*
+    n = n.wrapping_mul(K_STAR);
     n
 }
 
@@ -166,7 +167,8 @@ impl KmerCounterFilter {
 
     /// Increments the counter for a given hash value (saturating at 3).
     #[inline]
-    pub fn increment(&mut self, hash: u64) {
+    pub fn increment(&mut self, hashnc: u64) {
+        let hash=hashnc/(NUM_COUNTER_SHARDS as u64);
         let (vec_index, bit_offset) = self.get_counter_pos(hash);
         if vec_index < self.counters.len() {
             let current_val = (self.counters[vec_index] >> bit_offset) & 0b11;
@@ -183,7 +185,8 @@ impl KmerCounterFilter {
 
     /// Checks if the counter for a hash value is "solid" (value is 3).
     #[inline]
-    pub fn check_solid(&self, hash: u64) -> bool {
+    pub fn check_solid(&self, hashnc: u64) -> bool {
+        let hash=hashnc/(NUM_COUNTER_SHARDS as u64);
         let (vec_index, bit_offset) = self.get_counter_pos(hash);
         if vec_index < self.counters.len() {
             let current_val = (self.counters[vec_index] >> bit_offset) & 0b11;
@@ -224,6 +227,7 @@ fn run_counting_filter_pass(
          return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Filter counter number must be greater than 0"));
     }
     let counters_per_shard = (num_counters_total + NUM_COUNTER_SHARDS as u64 - 1) / NUM_COUNTER_SHARDS as u64;
+    // print!("counters_per_shard {}",counters_per_shard);
 
     // Create counter shards vector
     let counter_shards_vec: Vec<Arc<Mutex<KmerCounterFilter>>> = (0..NUM_COUNTER_SHARDS)
@@ -329,7 +333,6 @@ fn process_record_for_counting(
         if !should_process_kmer(hash_val, trailing_zeros) { continue; }
 
         let shard_idx = (hash_val as usize) % NUM_COUNTER_SHARDS;
-        if shard_idx >= NUM_COUNTER_SHARDS { continue; }
         if let Ok(mut counter_guard) = counter_shards[shard_idx].try_lock() {
             counter_guard.increment(hash_val);
         }
