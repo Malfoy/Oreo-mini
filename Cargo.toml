@@ -15,6 +15,7 @@ rayon = "1.8"
 nthash = "0.5.1"
 ahash = "0.8.11"
 indicatif = "0.17"
+bloomfilter = "3.0"
 
 [profile.dev]
 opt-level = 3
