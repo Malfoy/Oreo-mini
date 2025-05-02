@@ -1,9 +1,10 @@
+extern crate rlimit;
 use clap::Parser;
 use bio::io::{fasta::{self, FastaRead}, fastq::{self, FastqRead}};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression as GzipCompression;
-use zstd::stream::{Encoder, Decoder};
+use zstd::stream::{Encoder, Decoder}; // Keep Decoder for input, Encoder for final output
 use zstd::stream::raw::CParameter;
 use num_cpus;
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use rayon::{ThreadPoolBuilder, ThreadPool};
 use std::path::{Path, PathBuf};
-use indicatif::{ProgressBar, ProgressStyle}; // Removed MultiProgress
+use indicatif::{ProgressBar, ProgressStyle};
 use nthash::*;
 use ahash::AHashMap;
 
@@ -38,9 +39,10 @@ struct Args {
     #[arg(short, long, default_value = "21")]
     k: usize,
 
-    /// zstd compression level for writing intermediate partition files.
-    #[arg(long, default_value = "-4")]
-    compression_level: i32,
+    // --- REMOVED: compression_level is no longer needed for intermediate files ---
+    // #[arg(long, default_value = "-4")]
+    // compression_level: i32,
+    // --- END REMOVED ---
 
     /// Final compression algorithm ("zstd" or "gzip"). (Default: "zstd")
     #[arg(long, default_value = "zstd")]
@@ -69,7 +71,7 @@ struct Args {
 
     // --- Counting Filter Arguments (only used if --use-counting-filter is set) ---
     /// Total number of 2-bit counters (approximate size in bits = filter_counters * 2). Affects memory usage per shard.
-    #[arg(long, default_value = "10000000000")] 
+    #[arg(long, default_value = "10000000000")]
     filter_counters: u64,
 
     // --- Subsampling Argument ---
@@ -175,7 +177,7 @@ impl KmerCounterFilter {
             }
         } else {
             // This condition should ideally not be hit if num_counters is calculated correctly
-            eprintln!("Warning: Counter index out of bounds during increment: vec_idx={}, len={}", vec_index, self.counters.len());
+            // eprintln!("Warning: Counter index out of bounds during increment: vec_idx={}, len={}", vec_index, self.counters.len());
         }
     }
 
@@ -188,7 +190,7 @@ impl KmerCounterFilter {
             current_val == 3
         } else {
              // This condition should ideally not be hit
-            eprintln!("Warning: Counter index out of bounds during check_solid: vec_idx={}, len={}", vec_index, self.counters.len());
+            // eprintln!("Warning: Counter index out of bounds during check_solid: vec_idx={}, len={}", vec_index, self.counters.len());
             false
         }
     }
@@ -196,7 +198,6 @@ impl KmerCounterFilter {
 
 /// 64-bit multipliers for rolling hash (different for first- and second-level).
 const BASES: [u64; 9] = [0x9e3779b97f4a7c15, 0xc2b2ae3d27d4eb4f, 0x165667b19e3779f9, 0x27d4eb2f165667c5, 0xa0761d6478bd642f, 0xe7037ed1a0b428db, 0xbf58476d1ce4e5b9, 0x94d049bb133111eb, 0x2545f4914f6cdd1d];
-// *** Simplified: Only need one style now ***
 const PBSTYLE: &str = "{prefix} [{bar:40.cyan/blue}] {pos}/{len} {elapsed} ETA: {eta}";
 // --- Constants ---
 const NUM_COUNTER_SHARDS: usize = 1024; // Number of shards for the counter filter
@@ -245,7 +246,6 @@ fn run_counting_filter_pass(
 
     if is_fastq {
         let mut reader = fastq::Reader::new(buf_reader_main); // Use mut reader
-        // Process records sequentially to avoid large memory usage from collect()
         loop {
             record_chunk.clear();
             for _ in 0..READ_CHUNK_SIZE {
@@ -273,7 +273,6 @@ fn run_counting_filter_pass(
 
     } else { // FASTA
         let mut reader = fasta::Reader::new(buf_reader_main); // Use mut reader
-         // Process records sequentially
          loop {
              record_chunk.clear();
              for _ in 0..READ_CHUNK_SIZE {
@@ -299,9 +298,6 @@ fn run_counting_filter_pass(
         }
     }
 
-
-    // println!("Counting filter pass finished processing {} reads in {:.3} seconds.", total_reads_processed, start_pass.elapsed().as_secs_f64());
-
     Ok(counter_shards)
 }
 
@@ -321,47 +317,24 @@ fn process_record_for_counting(
     let seq_bytes = compressed_seq.as_bytes();
     if seq_bytes.len() < k { return; }
 
-    let kmer_iterator: Box<dyn Iterator<Item = u64> + Send> = if rc_sensitivity { // Added Send
+    let kmer_iterator: Box<dyn Iterator<Item = u64> + Send> = if rc_sensitivity {
         if let Ok(iter) = NtHashIterator::new(seq_bytes, k) { Box::new(iter) }
-        else {
-            // eprintln!("Warning: NtHashIterator failed (rc=true) for record ID: {}. Skipping record.", record_id(record));
-             return;
-        }
+        else { return; }
     } else {
         if let Ok(iter) = NtHashForwardIterator::new(seq_bytes, k) { Box::new(iter) }
-        else {
-            // eprintln!("Warning: NtHashForwardIterator failed (rc=false) for record ID: {}. Skipping record.", record_id(record));
-             return;
-        }
+        else { return; }
     };
 
     for hash_val in kmer_iterator {
         if !should_process_kmer(hash_val, trailing_zeros) { continue; }
 
         let shard_idx = (hash_val as usize) % NUM_COUNTER_SHARDS;
-        if shard_idx >= NUM_COUNTER_SHARDS {
-             // eprintln!("Warning: Calculated shard index {} out of bounds ({})", shard_idx, NUM_COUNTER_SHARDS); // Reduce noise
-             continue;
-        }
-        // Use try_lock to avoid blocking if the lock is contended, potentially skipping increments under high load
+        if shard_idx >= NUM_COUNTER_SHARDS { continue; }
         if let Ok(mut counter_guard) = counter_shards[shard_idx].try_lock() {
             counter_guard.increment(hash_val);
         }
-        // If try_lock fails, we just skip the increment for this k-mer.
-        // For counting filters, occasional misses are usually acceptable.
     }
 }
-
-// Helper to get record ID for logging (Optional)
-/*
-fn record_id(record: &Record) -> &str {
-    match record {
-        Record::Fasta { id, .. } => id,
-        Record::Fastq { id, .. } => id,
-    }
-}
-*/
-
 
 /// Computes the partition fingerprint using homopolymer-compressed and subsampled k-mers,
 /// checking the appropriate shard of the sharded KmerCounterFilter if provided.
@@ -391,37 +364,29 @@ fn compute_partition(
             if let Some(counter_shards) = counter_shards_opt {
                 let shard_idx = (kmer_hash as usize) % NUM_COUNTER_SHARDS;
                 if shard_idx < counter_shards.len() {
-                    // Use try_lock for checking as well, assume not solid if lock fails
                     if let Ok(counter_guard) = counter_shards[shard_idx].try_lock() {
                         process_kmer = counter_guard.check_solid(kmer_hash);
-                    } else {
-                         process_kmer = false; // Assume not solid if lock acquisition fails
-                    }
-                } else {
-                    // eprintln!("Warning: counter shard index out of bounds: {}", shard_idx); // Reduce noise
-                    process_kmer = false;
-                }
+                    } else { process_kmer = false; }
+                } else { process_kmer = false; }
             }
 
             if process_kmer {
                 let hash = kmer_hash.wrapping_mul(base);
                 let idx = if buckets_count > 1 { (hash >> (64 - index_bits)) as usize } else { 0 };
                 let value = hash & value_mask;
-
                 if idx < buckets_count {
                     buckets[idx] = Some(match buckets[idx] {
                         Some(current) if value >= current => current,
                         _ => value,
                     });
-                } // else { eprintln!("Warning: Calculated bucket index {} out of bounds ({})", idx, buckets_count); } // Reduce noise
+                }
             }
         }
-    } // else { eprintln!("Warning: NtHashForwardIterator failed in compute_partition. Returning 0."); } // Reduce noise
+    }
 
     let mut fingerprint = 0u64;
     for i in 0..p {
         let bucket_idx = i % buckets_count;
-        // Rotate bits instead of shifting and masking
         let bit = buckets[bucket_idx].map_or(0, |v| (v >> (i / buckets_count)) & 1);
         fingerprint = (fingerprint << 1) | bit;
     }
@@ -452,42 +417,33 @@ fn compute_partition_canonique(
     if let Ok(iter) = NtHashIterator::new(seq_bytes, k) { // Use canonical iterator
         for kmer_hash in iter {
             if !should_process_kmer(kmer_hash, trailing_zeros) { continue; }
-
             let mut process_kmer = true;
             if let Some(counter_shards) = counter_shards_opt {
                 let shard_idx = (kmer_hash as usize) % NUM_COUNTER_SHARDS;
                  if shard_idx < counter_shards.len() {
-                     // Use try_lock for checking as well, assume not solid if lock fails
                      if let Ok(counter_guard) = counter_shards[shard_idx].try_lock() {
                         process_kmer = counter_guard.check_solid(kmer_hash);
-                    } else {
-                         process_kmer = false; // Assume not solid if lock acquisition fails
-                    }
-                 } else {
-                    // eprintln!("Warning: counter shard index out of bounds: {}", shard_idx); // Reduce noise
-                    process_kmer = false;
-                 }
+                    } else { process_kmer = false; }
+                 } else { process_kmer = false; }
             }
 
             if process_kmer {
                 let hash = kmer_hash.wrapping_mul(base);
                 let idx = if buckets_count > 1 { (hash >> (64 - index_bits)) as usize } else { 0 };
                 let value = hash & value_mask;
-
                  if idx < buckets_count {
                     buckets[idx] = Some(match buckets[idx] {
                         Some(current) if value >= current => current,
                         _ => value,
                     });
-                } // else { eprintln!("Warning: Calculated bucket index {} out of bounds ({}) in canonique", idx, buckets_count); } // Reduce noise
+                }
             }
         }
-    } // else { eprintln!("Warning: NtHashIterator failed in compute_partition_canonique. Returning 0."); } // Reduce noise
+    }
 
     let mut fingerprint = 0u64;
     for i in 0..p {
         let bucket_idx = i % buckets_count;
-         // Rotate bits instead of shifting and masking
         let bit = buckets[bucket_idx].map_or(0, |v| (v >> (i / buckets_count)) & 1);
         fingerprint = (fingerprint << 1) | bit;
     }
@@ -513,7 +469,7 @@ fn reverse_complement(dna: &str) -> String {
             'C' | 'c' => 'G',
             'G' | 'g' => 'C',
             'N' | 'n' => 'N',
-            _ => n, // Keep other characters as they are
+            _ => n,
         })
         .collect()
 }
@@ -540,7 +496,7 @@ fn calculate_scores_compressed(
                     fwd_score = fwd_score.saturating_add(*kmer_counts.get(&fwd_kmer).unwrap_or(&0));
                 }
             }
-        } // else { eprintln!("Warning: NtHashForwardIterator failed in calculate_scores_compressed (fwd)."); } // Reduce noise
+        }
     }
     if compressed_rev.len() >= k {
          if let Ok(rev_iter) = NtHashForwardIterator::new(compressed_rev.as_bytes(), k) {
@@ -549,7 +505,7 @@ fn calculate_scores_compressed(
                      rev_score = rev_score.saturating_add(*kmer_counts.get(&rev_kmer).unwrap_or(&0));
                  }
             }
-        } // else { eprintln!("Warning: NtHashForwardIterator failed in calculate_scores_compressed (rev)."); } // Reduce noise
+        }
     }
     (fwd_score, rev_score)
 }
@@ -558,7 +514,7 @@ fn calculate_scores_compressed(
 /// Processes a single partition file for RC orientation update.
 /// Reads records, scores based on compressed/subsampled k-mers,
 /// flips records if necessary, and writes back to a temporary file before replacing the original.
-/// DOES NOT use the KmerCounterFilter.
+/// Assumes input partition file is UNCOMPRESSED. Writes temporary output UNCOMPRESSED.
 fn process_partition_for_rc(
     partition_filename: &str,
     args: &Args,
@@ -566,19 +522,17 @@ fn process_partition_for_rc(
     pool: &ThreadPool,
 ) -> std::io::Result<()> {
     let rc_loops = args.rc_compression_loop;
-    if rc_loops <= 0 { return Ok(()) }; // Skip if no loops requested
+    if rc_loops <= 0 { return Ok(()) };
 
-    // Open input safely
+    // --- Open UNCOMPRESSED input ---
     let input_file = match File::open(partition_filename) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), // Not an error if file DNE
-        Err(e) => return Err(e), // Other errors are propagated
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
-    // Assume intermediate files are zstd compressed
-    let input_reader : Box<dyn Read> = Box::new(Decoder::new(input_file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?);
-
+    let input_reader : Box<dyn Read> = Box::new(input_file);
     let buf_reader = BufReader::new(input_reader);
-    let compression_level = args.compression_level; // Use intermediate level
+
     let trailing_zeros = args.trailing_zeros;
 
     // Determine file type
@@ -587,16 +541,16 @@ fn process_partition_for_rc(
     let is_fastq = first_line.as_deref().map_or(false, |line| line.starts_with('@'));
     drop(peekable_reader);
 
-    // Re-open for actual reading (need to handle potential compression again)
+    // --- Re-open UNCOMPRESSED for actual reading ---
     let input_file_main = File::open(partition_filename)?;
-    let input_reader_main : Box<dyn Read> = Box::new(Decoder::new(input_file_main).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?);
+    let input_reader_main : Box<dyn Read> = Box::new(input_file_main);
     let buf_reader_main = BufReader::new(input_reader_main);
 
     let mut records: Vec<Record> = Vec::new();
     // Read all records from the partition file
     if is_fastq {
-        let  reader = fastq::Reader::new(buf_reader_main); // mut reader
-        for result in reader.records() { // Use iterator method
+        let reader = fastq::Reader::new(buf_reader_main);
+        for result in reader.records() {
             match result {
                 Ok(record) => {
                     let id = record.id().to_owned();
@@ -608,8 +562,8 @@ fn process_partition_for_rc(
             }
         }
     } else {
-        let  reader = fasta::Reader::new(buf_reader_main); // mut reader
-        for result in reader.records() { // Use iterator method
+        let reader = fasta::Reader::new(buf_reader_main);
+        for result in reader.records() {
              match result {
                  Ok(record) => {
                      let id = record.id().to_owned();
@@ -641,7 +595,7 @@ fn process_partition_for_rc(
                             *counts_guard.entry(kmer_hash).or_insert(0) += 1;
                         }
                     }
-                } // else { eprintln!("Warning: NtHashForwardIterator failed during initial RC count population."); }
+                }
             }
         });
     });
@@ -651,41 +605,32 @@ fn process_partition_for_rc(
         // Score calculation (parallel)
         let flip_decisions: Vec<(usize, bool, String, Option<String>)> = pool.install(|| {
             records.par_iter().enumerate().map(|(idx, record)| {
-                let kmer_counts_guard = kmer_counts_arc.lock().unwrap(); // Lock for read access
+                let kmer_counts_guard = kmer_counts_arc.lock().unwrap();
                 let (should_flip, rev_seq_opt, rev_qual_opt) = match record {
                     Record::Fastq { seq, qual, .. } => {
                         let rev_seq = reverse_complement(seq);
                         let (fwd_score, rev_score) = calculate_scores_compressed(seq, &rev_seq, k, &kmer_counts_guard, trailing_zeros);
-                        // Flip if reverse is strictly better
                         if rev_score > fwd_score { (true, Some(rev_seq), Some(qual.chars().rev().collect())) } else { (false, None, None) }
                     }
                     Record::Fasta { seq, .. } => {
                         let rev_seq = reverse_complement(seq);
                         let (fwd_score, rev_score) = calculate_scores_compressed(seq, &rev_seq, k, &kmer_counts_guard, trailing_zeros);
-                         // Flip if reverse is strictly better
                         if rev_score > fwd_score { (true, Some(rev_seq), None) } else { (false, None, None) }
                     }
                 };
-                 drop(kmer_counts_guard); // Release read lock quickly
+                 drop(kmer_counts_guard);
                 (idx, should_flip, rev_seq_opt.unwrap_or_default(), rev_qual_opt)
             }).filter(|(_, should_flip, _, _)| *should_flip).collect()
         });
 
         let flipped_count = flip_decisions.len();
-        if flipped_count == 0 {
-             // println!("RC loop converged for {}", partition_filename); // Debug message
-             break;
-        }
-        // println!("RC loop: {} flips for {}", flipped_count, partition_filename); // Debug message
+        if flipped_count == 0 { break; }
 
-
-        // Update dictionary and records (sequential for safety of map updates)
-        let mut kmer_counts_guard = kmer_counts_arc.lock().unwrap(); // Lock for updates
-
+        // Update dictionary and records (sequential)
+        let mut kmer_counts_guard = kmer_counts_arc.lock().unwrap();
         for (idx, _should_flip, rev_seq, rev_qual_opt) in flip_decisions {
              match &mut records[idx] {
                  Record::Fastq { seq, qual, .. } => {
-                     // --- Decrement old counts ---
                      let old_compressed = homopolymer_compress(seq);
                      if old_compressed.len() >= k {
                          if let Ok(iter) = NtHashForwardIterator::new(old_compressed.as_bytes(), k) {
@@ -693,18 +638,13 @@ fn process_partition_for_rc(
                                  if should_process_kmer(kmer_hash, trailing_zeros) {
                                     if let Some(count) = kmer_counts_guard.get_mut(&kmer_hash) {
                                         *count = count.saturating_sub(1);
-                                        // Option: Remove entry if count becomes 0? map.remove(&kmer_hash);
                                     }
                                  }
                              }
-                         } // else { eprintln!("Warning: NtHashForwardIterator failed during RC update (fastq decr)."); }
+                         }
                      }
-
-                     // --- Update record ---
                      *seq = rev_seq;
                      *qual = rev_qual_opt.expect("Missing rev_qual for FASTQ");
-
-                     // --- Increment new counts ---
                      let new_compressed = homopolymer_compress(seq);
                       if new_compressed.len() >= k {
                          if let Ok(iter) = NtHashForwardIterator::new(new_compressed.as_bytes(), k) {
@@ -713,11 +653,10 @@ fn process_partition_for_rc(
                                      *kmer_counts_guard.entry(kmer_hash).or_insert(0) += 1;
                                  }
                              }
-                         } // else { eprintln!("Warning: NtHashForwardIterator failed during RC update (fastq incr)."); }
+                         }
                      }
                  }
                  Record::Fasta { seq, .. } => {
-                      // --- Decrement old counts ---
                       let old_compressed = homopolymer_compress(seq);
                       if old_compressed.len() >= k {
                          if let Ok(iter) = NtHashForwardIterator::new(old_compressed.as_bytes(), k) {
@@ -725,17 +664,12 @@ fn process_partition_for_rc(
                                  if should_process_kmer(kmer_hash, trailing_zeros) {
                                     if let Some(count) = kmer_counts_guard.get_mut(&kmer_hash) {
                                         *count = count.saturating_sub(1);
-                                        // Option: Remove entry if count becomes 0? map.remove(&kmer_hash);
                                     }
                                  }
                              }
-                         } // else { eprintln!("Warning: NtHashForwardIterator failed during RC update (fasta decr)."); }
+                         }
                      }
-
-                      // --- Update record ---
                       *seq = rev_seq;
-
-                      // --- Increment new counts ---
                       let new_compressed = homopolymer_compress(seq);
                       if new_compressed.len() >= k {
                          if let Ok(iter) = NtHashForwardIterator::new(new_compressed.as_bytes(), k) {
@@ -744,21 +678,19 @@ fn process_partition_for_rc(
                                      *kmer_counts_guard.entry(kmer_hash).or_insert(0) += 1;
                                  }
                              }
-                         } // else { eprintln!("Warning: NtHashForwardIterator failed during RC update (fasta incr)."); }
+                         }
                      }
                  }
              }
         }
-        drop(kmer_counts_guard); // Release update lock
+        drop(kmer_counts_guard);
     }
 
-    // Write updated records to a temporary file
+    // --- Write updated records to an UNCOMPRESSED temporary file ---
     let temp_partition_filename = partition_filename.to_owned() + ".rc_temp";
-    { // Scope for writer/encoder
+    { // Scope for writer
         let temp_file = File::create(&temp_partition_filename)?;
-        // Use zstd for temp file writing, matching intermediate format
-        let encoder = Encoder::new(temp_file, compression_level)?;
-        let mut writer = BufWriter::new(encoder);
+        let mut writer = BufWriter::new(temp_file);
 
         if is_fastq {
              let mut fastq_writer = fastq::Writer::new(&mut writer);
@@ -768,7 +700,7 @@ fn process_partition_for_rc(
                      fastq_writer.write_record(&fastq_record)?;
                  }
              }
-             fastq_writer.flush()?; // Flush bio writer
+             fastq_writer.flush()?;
         } else {
             let mut fasta_writer = fasta::Writer::new(&mut writer);
              for record in &records {
@@ -777,12 +709,10 @@ fn process_partition_for_rc(
                     fasta_writer.write_record(&fasta_record)?;
                  }
              }
-            fasta_writer.flush()?; // Flush bio writer
+            fasta_writer.flush()?;
         }
         writer.flush()?; // Flush BufWriter
-        let encoder = writer.into_inner().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Writer error: {}", e)))?;
-        encoder.finish()?; // Finish zstd stream
-    } // Writer/encoder scope ends, file is closed
+    } // Writer scope ends, file is closed
 
     // Replace original partition file
     fs::rename(&temp_partition_filename, partition_filename)?;
@@ -792,12 +722,11 @@ fn process_partition_for_rc(
 
 
 
-/// Creates bucket files. Fingerprint is calculated from compressed & subsampled sequence,
+/// Creates UNCOMPRESSED bucket files. Fingerprint is calculated from compressed & subsampled sequence,
 /// but the *original* sequence is written to the partition file.
-/// Uses intermediate compression level (zstd).
 fn create_bucket_files(
     filename_input: &str,
-    filename_comp_base: &str, // Base name for partition files for THIS level
+    filename_comp_base: &str, // Base name for partition files
     args: &Args,
     p: usize,
     k: usize,
@@ -811,28 +740,22 @@ fn create_bucket_files(
     let is_fastq = !peek.is_empty() && peek[0] == b'@';
     drop(buf_reader); // Close peeking reader
 
-    let compression_level = args.compression_level; // Intermediate level
     let rc_sensitivity = args.rc_sensitivity;
     let trailing_zeros = args.trailing_zeros;
     let size_array = 1usize << p;
 
     if let Some(parent_dir) = Path::new(filename_comp_base).parent() { fs::create_dir_all(parent_dir)?; }
 
-    let mut writers: Vec<Arc<Mutex<BufWriter<Encoder<File>>>>> = Vec::with_capacity(size_array);
+    let mut writers: Vec<Arc<Mutex<BufWriter<File>>>> = Vec::with_capacity(size_array);
     for fp in 0..size_array {
-        // Generate partition name based on output base for this level
         let filename_partition = get_filename_partition(filename_comp_base, fp, p);
         let file = File::create(&filename_partition).unwrap_or_else(|e| panic!("Cannot create partition file {}: {}", filename_partition, e));
-        // Always use zstd for intermediate files
-        let encoder = Encoder::new(file, compression_level).expect("Cannot create zstd encoder for partition");
-        writers.push(Arc::new(Mutex::new(BufWriter::new(encoder))));
+        writers.push(Arc::new(Mutex::new(BufWriter::new(file))));
     }
     let files = Arc::new(writers);
 
-    // Create a dedicated pool for this function to avoid nested pool.install issues if called recursively within a pool
     let num_workers = if args.thread > 0 { std::cmp::min(args.thread, num_cpus::get()) } else { num_cpus::get() };
     let pool = ThreadPoolBuilder::new().num_threads(num_workers).build().unwrap();
-
 
     // --- Process Reads in Chunks for Partitioning ---
     let mut record_chunk = Vec::with_capacity(READ_CHUNK_SIZE);
@@ -841,12 +764,10 @@ fn create_bucket_files(
     let input_reader_main = open_input(filename_input);
     let buf_reader_main = BufReader::new(input_reader_main);
 
-    // Local copy of counter_shards_opt to move into the closure
     let counter_shards_ref = counter_shards_opt.clone();
 
     if is_fastq {
-        let mut reader = fastq::Reader::new(buf_reader_main); // mut reader
-        // Process sequentially to limit memory
+        let mut reader = fastq::Reader::new(buf_reader_main);
         loop {
             record_chunk.clear();
             for _ in 0..READ_CHUNK_SIZE {
@@ -865,13 +786,12 @@ fn create_bucket_files(
             if record_chunk.is_empty() { break; }
             _total_reads_partitioned += record_chunk.len() as u64;
 
-            // Pass the cloned Arc reference
             let counter_shards_iter = counter_shards_ref.clone();
             pool.install(|| {
                 record_chunk.par_iter().for_each(|record| {
                     let (id, original_seq, qual_opt) = match record {
                         Record::Fastq { id, seq, qual } => (id.clone(), seq.clone(), Some(qual.clone())),
-                         _ => unreachable!(), // Should only contain FASTQ here
+                         _ => unreachable!(),
                     };
                     let counter_ref_inner = counter_shards_iter.as_ref();
                     let fp = if rc_sensitivity {
@@ -885,20 +805,19 @@ fn create_bucket_files(
                      match files[fp_usize].lock() {
                          Ok(mut writer) => {
                              if let Some(qual) = qual_opt { // FASTQ
-                                 if writeln!(writer, "@{}", id).is_err() { /* eprintln!("Write error (FASTQ ID)"); */ return; } // Reduce noise
-                                 if writeln!(writer, "{}", original_seq).is_err() { /* eprintln!("Write error (FASTQ Seq)"); */ return; }
-                                 if writeln!(writer, "+").is_err() { /* eprintln!("Write error (FASTQ Plus)"); */ return; }
-                                 if writeln!(writer, "{}", qual).is_err() { /* eprintln!("Write error (FASTQ Qual)"); */ return; }
-                             } else { unreachable!() } // Should be FASTQ
+                                 if writeln!(writer, "@{}", id).is_err() { return; }
+                                 if writeln!(writer, "{}", original_seq).is_err() { return; }
+                                 if writeln!(writer, "+").is_err() { return; }
+                                 if writeln!(writer, "{}", qual).is_err() { return; }
+                             } else { unreachable!() }
                          },
-                         Err(_) => { eprintln!("Partition writer mutex poisoned for fp={}", fp_usize); } // Handle mutex poisoning
+                         Err(_) => { eprintln!("Partition writer mutex poisoned for fp={}", fp_usize); }
                      }
                 });
             });
         }
     } else { // FASTA
-        let mut reader = fasta::Reader::new(buf_reader_main); // mut reader
-         // Process sequentially to limit memory
+        let mut reader = fasta::Reader::new(buf_reader_main);
         loop {
             record_chunk.clear();
              for _ in 0..READ_CHUNK_SIZE {
@@ -921,7 +840,7 @@ fn create_bucket_files(
                  record_chunk.par_iter().for_each(|record| {
                     let (id, original_seq) = match record {
                         Record::Fasta { id, seq } => (id.clone(), seq.clone()),
-                         _ => unreachable!(), // Should only contain FASTA here
+                         _ => unreachable!(),
                     };
 
                     let counter_ref_inner = counter_shards_iter.as_ref();
@@ -935,75 +854,47 @@ fn create_bucket_files(
 
                      match files[fp_usize].lock() {
                         Ok(mut writer) => {
-                             if writeln!(writer, ">{}", id).is_err() { /* eprintln!("Write error (FASTA ID)"); */ return; } // Reduce noise
-                             if writeln!(writer, "{}", original_seq).is_err() { /* eprintln!("Write error (FASTA Seq)"); */ return; }
+                             if writeln!(writer, ">{}", id).is_err() { return; }
+                             if writeln!(writer, "{}", original_seq).is_err() { return; }
                          },
-                         Err(_) => { eprintln!("Partition writer mutex poisoned for fp={}", fp_usize); } // Handle mutex poisoning
+                         Err(_) => { eprintln!("Partition writer mutex poisoned for fp={}", fp_usize); }
                      }
                  });
             });
         }
     }
 
-    // println!("Flushing and closing partition writers for base {}...", filename_comp_base); // Debug
+    // --- Flush and close UNCOMPRESSED partition writers ---
     for (idx, writer_mutex) in files.iter().enumerate() {
-        // Attempt to acquire the lock. If poisoned, report but continue.
         match writer_mutex.lock() {
             Ok(mut writer_guard) => {
-                // Create a dummy encoder to replace the existing one cleanly
-                // Use a unique temp name based on pid and index
-                let temp_dummy_path = std::env::temp_dir().join(format!("dummy_{}_{}.tmp", std::process::id(), idx));
-                let dummy_file = File::create(&temp_dummy_path)?;
-                let dummy_encoder = Encoder::new(dummy_file, 0).expect("Failed to create dummy encoder");
-                let mut writer = std::mem::replace(&mut *writer_guard, BufWriter::new(dummy_encoder));
-
-                // Explicitly flush BufWriter first
-                if let Err(e) = writer.flush() {
+                if let Err(e) = writer_guard.flush() {
                     eprintln!("Flush error for partition writer {}: {}", idx, e);
-                    // Try to continue to finish the encoder anyway
                 }
-
-                // Get the inner encoder and finish it
-                match writer.into_inner() {
-                    Ok(encoder) => {
-                        if let Err(e) = encoder.finish() {
-                            eprintln!("Error finishing zstd encoder for partition {}: {}", idx, e);
-                        }
-                    }
-                    Err(e) => {
-                        // This indicates unflushed data in BufWriter, likely due to the flush error above
-                        eprintln!("Error retrieving inner encoder for partition {} (potential unflushed data): {}", idx, e);
-                    }
-                }
-                 // Clean up the dummy file
-                 let _ = fs::remove_file(&temp_dummy_path);
             },
             Err(_) => {
                  eprintln!("Partition writer mutex poisoned during close for index {}. Data might be lost.", idx);
             }
         }
     }
-    // println!("Finished closing partition writers for base {}.", filename_comp_base); // Debug
 
     Ok(())
 }
 
 
-/// Concatenates bucket files using Gray code order and cleans up partitions.
+/// Concatenates UNCOMPRESSED bucket files using Gray code order and cleans up partitions.
 /// Handles final compression type (zstd/gzip).
 fn concat_bucket_files(
-    partition_base_filename: &str, // Base name used for creating partitions (e.g., .../output.tmp_oreo)
+    partition_base_filename: &str, // Base name used for creating partitions
     final_output_filename: &str,    // The actual final output file path
     args: &Args,
     p: usize,
     pool: &ThreadPool, // For parallel cleanup
 ) -> std::io::Result<()> {
-    // println!("Concatenating {} partitions into {}", 1 << p, final_output_filename);
     let gray_order = generate_gray_code_order(p);
 
     if let Some(parent_dir) = Path::new(final_output_filename).parent() { fs::create_dir_all(parent_dir)?; }
 
-    // Determine compression level and type for the final output file
     let output_compression_level = args.final_compression_level;
     let use_gzip_final = args.final_compression.to_lowercase() == "gzip";
 
@@ -1013,74 +904,60 @@ fn concat_bucket_files(
         let gzip_level = GzipCompression::new(output_compression_level.clamp(0, 9) as u32);
         println!("Using Gzip level {} for final output: {}", output_compression_level.clamp(0, 9), final_output_filename);
         let encoder = GzEncoder::new(final_file, gzip_level);
-        let mut buf_writer = BufWriter::new(encoder); // GzEncoder doesn't need explicit finish if dropped/flushed
+        let mut buf_writer = BufWriter::new(encoder);
 
         for partition_idx in &gray_order {
             let part_filename = get_filename_partition(partition_base_filename, *partition_idx, p);
             match File::open(&part_filename) {
                 Ok(file) => {
-                    // Partitions are always zstd compressed
-                    let mut decoder = match Decoder::new(BufReader::new(file)) {
-                         Ok(d) => d,
-                         Err(_e) => { eprintln!("Error creating zstd decoder for partition {}. Skipping.", part_filename); continue; } // Log _e if needed
-                    };
-                    match std::io::copy(&mut decoder, &mut buf_writer) {
+                    let mut reader = BufReader::new(file);
+                    match std::io::copy(&mut reader, &mut buf_writer) {
                          Ok(_) => {  }
-                         Err(_e) => { eprintln!("Error concatenating partition {} into {}", part_filename, final_output_filename); } // Log _e if needed
+                         Err(_e) => { eprintln!("Error concatenating partition {} into {}", part_filename, final_output_filename); }
                      }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => { /* Okay if empty */ }
-                Err(_e) => { eprintln!("Warning: Could not open partition file {} for concatenation", part_filename); } // Log _e if needed
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => { /* Okay */ }
+                Err(_e) => { eprintln!("Warning: Could not open partition file {} for concatenation", part_filename); }
             }
         }
-        buf_writer.flush()?; // Flush BufWriter contents
-        // GzEncoder finish is called on drop
+        buf_writer.flush()?;
     } else {
         // Use zstd for final output
         let zstd_level = output_compression_level;
         println!("Using Zstd level {} for final output: {}", zstd_level, final_output_filename);
-        let mut encoder = Encoder::new(final_file, zstd_level).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Cannot create final zstd encoder for {}: {}", final_output_filename, e)))?;
+        let encoder_result = Encoder::new(final_file, zstd_level);
+        let mut encoder = encoder_result.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Cannot create final zstd encoder for {}: {}", final_output_filename, e)))?;
+
         let num_threads = if args.thread > 0 { args.thread } else { num_cpus::get() };
-        let mut encoder = if num_threads > 0 {
-             // Allow failure for ZSTD single-threaded versions
-            match encoder.set_parameter(CParameter::NbWorkers(num_threads as u32)) {
-                Ok(_) => encoder,
-                Err(_) => {
-                    eprintln!("Warning: Failed to set {} threads for ZSTD compression.", num_threads);
-                    encoder // Proceed with default thread count
-                }
-            }
-        } else { encoder };
-
-        let mut buf_writer = BufWriter::new(&mut encoder); // Write to encoder reference
-
-        for partition_idx in &gray_order {
-            let part_filename = get_filename_partition(partition_base_filename, *partition_idx, p);
-            match File::open(&part_filename) {
-                Ok(file) => {
-                    let mut decoder = match Decoder::new(BufReader::new(file)) {
-                         Ok(d) => d,
-                         Err(_e) => { eprintln!("Error creating zstd decoder for partition {}. Skipping.", part_filename); continue; } // Log _e if needed
-                    };
-                    match std::io::copy(&mut decoder, &mut buf_writer) {
-                         Ok(_) => {  }
-                         Err(_e) => { eprintln!("Error concatenating partition {} into {}", part_filename, final_output_filename); } // Log _e if needed
-                     }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => { /* Okay if empty */ }
-                Err(_e) => { eprintln!("Warning: Could not open partition file {} for concatenation", part_filename); } // Log _e if needed
+        if num_threads > 0 {
+            if encoder.set_parameter(CParameter::NbWorkers(num_threads as u32)).is_err() {
+                 eprintln!("Warning: Failed to set {} threads for ZSTD compression.", num_threads);
             }
         }
-        buf_writer.flush()?; // Flush BufWriter contents
-        // Need to drop buf_writer to release the mutable borrow on encoder
-        drop(buf_writer);
+
+        // Scope buf_writer so it's dropped before encoder.finish()
+        {
+            let mut buf_writer = BufWriter::new(&mut encoder);
+            for partition_idx in &gray_order {
+                let part_filename = get_filename_partition(partition_base_filename, *partition_idx, p);
+                match File::open(&part_filename) {
+                    Ok(file) => {
+                        let mut reader = BufReader::new(file);
+                        match std::io::copy(&mut reader, &mut buf_writer) {
+                             Ok(_) => { }
+                             Err(_e) => { eprintln!("Error concatenating partition {} into {}", part_filename, final_output_filename); }
+                         }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => { /* Okay */ }
+                    Err(_e) => { eprintln!("Warning: Could not open partition file {} for concatenation", part_filename); }
+                }
+            }
+            buf_writer.flush()?;
+        } // buf_writer is dropped here, releasing borrow on encoder
         encoder.finish()?; // Finish ZstdEncoder
     }
 
-    // println!("Successfully wrote {} bytes to {}", total_bytes_written, final_output_filename);
-
     // --- Clean up partition files ---
-    // println!("Cleaning up {} partition files for base: {}", 1 << p, partition_base_filename);
     let cleanup_errors = Arc::new(Mutex::new(Vec::new()));
     pool.install(|| {
          (0..(1 << p)).into_par_iter().for_each(|i| {
@@ -1104,31 +981,57 @@ fn concat_bucket_files(
 
 /// Generates the filename for a specific partition based on a base name.
 fn get_filename_partition(base_filename: &str, partition: usize, p: usize) -> String {
-    // Find the position of the last extension separator ('.')
     let (stem, extension) = match base_filename.rfind('.') {
-        Some(idx) if !base_filename[idx..].contains('/') && !base_filename[idx..].contains('\\') => { // Make sure '.' is not part of a directory name
+        Some(idx) if !base_filename[idx..].contains('/') && !base_filename[idx..].contains('\\') => {
              (&base_filename[..idx], &base_filename[idx..])
         },
-        _ => (base_filename, ""), // No extension found or '.' is in directory path
+        _ => (base_filename, ""),
     };
-
-    // Format partition index as binary string with 'p' digits
     let partition_id = format!("{:0width$b}", partition, width = p);
-
-    // Append partition ID before the extension (if any)
     format!("{}_{}{}", stem, partition_id, extension)
 }
 
+fn increase_file_limit(requested_limit: u64) -> io::Result<()> {
+    let (soft_limit, hard_limit) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+    println!("Current file limits: soft={}, hard={}", soft_limit, hard_limit);
+
+    let target_limit = std::cmp::min(requested_limit, hard_limit); // Don't exceed hard limit
+
+    if target_limit > soft_limit {
+        match rlimit::setrlimit(rlimit::Resource::NOFILE, target_limit, hard_limit) {
+            Ok(_) => {
+                let (new_soft, new_hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+                println!("Successfully set file limits: soft={}, hard={}", new_soft, new_hard);
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to increase file limit to {}: {}", target_limit, e);
+                eprintln!("Proceeding with current limit: {}", soft_limit);
+                // Don't return error, just warn and continue
+            }
+        }
+    } else {
+        println!("Current soft limit ({}) is already sufficient.", soft_limit);
+    }
+    Ok(())
+}
 
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-    println!("Running with arguments: {:?}", args); // Print args for debugging
+    println!("Running with arguments: {:?}", args);
     let start_total = Instant::now();
     fs::create_dir_all(&args.output).expect("Cannot create output directory");
 
     let k = args.k;
-    let p = args.p; // Single p value
+    let p = args.p;
+
+    // --- Increase file limit ---
+    let num_partitions = 1usize << p;
+    // Request slightly more than needed for safety margin (e.g., + stdin/out/err + some buffer)
+    let requested_limit = (num_partitions + 100) as u64;
+    increase_file_limit(requested_limit)?;
+    // --- End increase file limit ---
+
 
     let num_threads = if args.thread > 0 { args.thread } else { num_cpus::get() };
     println!("Using {} threads for processing.", num_threads);
@@ -1153,24 +1056,20 @@ fn main() -> std::io::Result<()> {
     let final_filename_stem = format!("{}_k{}_p{}", input_stem, k, p_string);
     let final_extension = match args.final_compression.to_lowercase().as_str() {
         "gzip" | "gz" => "gz",
-        _ => "zst", // Default to zstd
+        _ => "zst",
     };
-    // This is the target filename for the *final* concatenated output
     let final_output_filename = PathBuf::from(&args.output)
                                 .join(format!("{}.{}", final_filename_stem, final_extension))
                                 .to_string_lossy()
                                 .into_owned();
-    // This is the base name used for the intermediate partition files
     let intermediate_base_filename = PathBuf::from(&args.output)
-                                .join(format!("{}.tmp_oreo", final_filename_stem)) // Use a distinct name for intermediates
+                                .join(format!("{}.tmp_oreo", final_filename_stem))
                                 .to_string_lossy()
                                 .into_owned();
 
 
     println!("Input file: {}", args.input);
     println!("Working directory: {}", args.output);
-    // println!("Final output target: {}", final_output_filename);
-    // println!("Intermediate base: {}", intermediate_base_filename);
 
 
     // --- Pipeline Steps ---
@@ -1178,7 +1077,9 @@ fn main() -> std::io::Result<()> {
     // 1. Optional Counting Filter Pass
     let counter_shards_opt: Option<Arc<Vec<Arc<Mutex<KmerCounterFilter>>>>> = if args.use_counting_filter {
         println!("--- Phase 1: Counting Filter Population ---");
+        let start_phase = Instant::now();
         let filters = run_counting_filter_pass(&args.input, k, &args, &pool)?;
+        println!("Counting Filter Population finished in {:.3} seconds.", start_phase.elapsed().as_secs_f64());
         Some(filters)
     } else {
         println!("--- Phase 1: Counting Filter Population (Skipped) ---");
@@ -1187,24 +1088,23 @@ fn main() -> std::io::Result<()> {
 
     // 2. Partitioning Pass (Single Level)
     println!("--- Phase 2: Partitioning (p={}) ---", p);
-    let base_for_level = BASES[0]; // Use the first base multiplier
-    // *** Call create_bucket_files directly ***
+    let start_phase = Instant::now();
+    let base_for_level = BASES[0];
     create_bucket_files(
         &args.input,
-        &intermediate_base_filename, // Use intermediate base name
+        &intermediate_base_filename,
         &args, p, k, base_for_level,
-        counter_shards_opt.clone(), // Pass the Option Arc
+        counter_shards_opt.clone(),
     )?;
-    // println!("Partitioning phase complete.");
+    println!("Partitioning finished in {:.3} seconds.", start_phase.elapsed().as_secs_f64());
 
     // 3. Release Counter Filter Memory
-    // println!("--- Releasing Counting Filter Memory ---");
     drop(counter_shards_opt);
 
     // 4. Reverse Complementation Pass
      println!("--- Phase 3: Reverse Complement Update ---");
+     let start_phase = Instant::now();
      if args.rc_compression_loop > 0 {
-         let num_partitions = 1usize << p;
          let rc_bar = ProgressBar::new(num_partitions as u64);
          rc_bar.set_style(ProgressStyle::default_bar().template(PBSTYLE).unwrap().progress_chars("##-"));
          rc_bar.set_prefix(format!("RC Update (p={})", p));
@@ -1212,10 +1112,9 @@ fn main() -> std::io::Result<()> {
          pool.install(|| {
              (0..num_partitions).into_par_iter().for_each(|i| {
                  let filename_partition = get_filename_partition(&intermediate_base_filename, i, p);
-                 if Path::new(&filename_partition).exists() {
-                     if let Err(e) = process_partition_for_rc(&filename_partition, &args, k, &pool) {
-                         eprintln!("Error during RC processing for partition {}: {}", filename_partition, e);
-                     }
+                 // No need to check exists here, process_partition_for_rc handles NotFound
+                 if let Err(e) = process_partition_for_rc(&filename_partition, &args, k, &pool) {
+                     eprintln!("Error during RC processing for partition {}: {}", filename_partition, e);
                  }
                  rc_bar.inc(1);
              });
@@ -1224,20 +1123,19 @@ fn main() -> std::io::Result<()> {
      } else {
          println!("Skipping RC update pass (rc_compression_loop = {}).", args.rc_compression_loop);
      }
-     println!("RC update phase complete.");
+     println!("RC Update finished in {:.3} seconds.", start_phase.elapsed().as_secs_f64());
 
 
     // 5. Concatenation and Cleanup Pass
     println!("--- Phase 4: Concatenation and Cleanup ---");
-    // *** Call simplified concat_bucket_files ***
+    let start_phase = Instant::now();
      concat_bucket_files(
-         &intermediate_base_filename, // Source partitions base name
-         &final_output_filename,      // Target final file
+         &intermediate_base_filename,
+         &final_output_filename,
          &args, p, &pool
      )?;
-    //  println!("Concatenation and cleanup complete.");
+     println!("Concatenation and Cleanup finished in {:.3} seconds.", start_phase.elapsed().as_secs_f64());
 
-     // --- No rename needed, concat writes directly to final ---
 
     // --- Final Statistics ---
     let final_meta = match fs::metadata(&final_output_filename) {
@@ -1254,9 +1152,7 @@ fn main() -> std::io::Result<()> {
     let final_size_mb = final_size as f64 / (1024.0 * 1024.0);
     let elapsed_total = start_total.elapsed().as_secs_f64();
 
-    println!("--- Processing Complete ---");
     println!("Final archive size: {:.3} MB", final_size_mb);
     println!("Total run time: {:.3} seconds", elapsed_total);
-    println!("Final compressed file: {}", final_output_filename);
     Ok(())
 }

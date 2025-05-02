@@ -16,6 +16,7 @@ nthash = "0.5.1"
 ahash = "0.8.11"
 indicatif = "0.17"
 bloomfilter = "3.0"
+rlimit = "0.10.2"
 
 [profile.dev]
 opt-level = 3
