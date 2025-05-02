@@ -76,7 +76,7 @@ struct Args {
 
     // --- Subsampling Argument ---
     /// Number of trailing zeros required in k-mer hash for subsampling (0=no subsampling, 1=1/2, 2=1/4, etc.).
-    #[arg(long, default_value = "1")] // Default to 1 (hash ends in 0)
+    #[arg(long, default_value = "3")] // Default to 1 (hash ends in 0)
     trailing_zeros: u32,
 }
 
